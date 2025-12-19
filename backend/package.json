@@ -1,0 +1,16 @@
+{
+  "name": "klv-display-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "fluent-ffmpeg": "^2.1.2",
+    "mediasoup": "^3.19.14",
+    "ws": "^8.14.2"
+  }
+}

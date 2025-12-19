@@ -1,0 +1,6 @@
+node_modules/
+samples/
+hls/
+.simulator.pid
+*.log
+.DS_Store
