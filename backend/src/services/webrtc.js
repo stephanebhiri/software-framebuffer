@@ -52,9 +52,17 @@ export class WebRTCService extends EventEmitter {
     this.router = null;
     this.producer = null;
     this.plainTransport = null;
-    this.clients = new Map(); // clientId -> { transport, consumer }
+    this.clients = new Map(); // clientId -> { transport, consumer, connectionTimeout }
     this.isReady = false;
     this.rtpPort = null;
+
+    // Recovery settings
+    this.workerRestartAttempts = 0;
+    this.maxWorkerRestarts = 3;
+    this.workerRestartDelay = 3000;
+
+    // Timeouts
+    this.transportConnectTimeout = 15000;
   }
 
   /**
@@ -68,7 +76,7 @@ export class WebRTCService extends EventEmitter {
 
     this.worker.on('died', (error) => {
       console.error('mediasoup worker died:', error);
-      this.emit('error', error);
+      this._handleWorkerCrash(error);
     });
 
     // Create router
@@ -78,7 +86,48 @@ export class WebRTCService extends EventEmitter {
 
     console.log('mediasoup initialized');
     this.isReady = true;
+    this.workerRestartAttempts = 0; // Reset on successful init
     return this.router.rtpCapabilities;
+  }
+
+  /**
+   * Handle worker crash with auto-recovery
+   */
+  _handleWorkerCrash(error) {
+    this.isReady = false;
+    this.router = null;
+    this.producer = null;
+    this.plainTransport = null;
+    this.rtpPort = null;
+
+    // Notify all clients
+    this.emit('worker-died', error);
+
+    // Clear all client transports (they're now invalid)
+    for (const [clientId, client] of this.clients) {
+      if (client.connectionTimeout) clearTimeout(client.connectionTimeout);
+    }
+    this.clients.clear();
+
+    // Attempt restart
+    if (this.workerRestartAttempts < this.maxWorkerRestarts) {
+      this.workerRestartAttempts++;
+      console.log(`mediasoup: Restart attempt ${this.workerRestartAttempts}/${this.maxWorkerRestarts} in ${this.workerRestartDelay}ms`);
+
+      setTimeout(async () => {
+        try {
+          await this.init();
+          console.log('mediasoup: Worker restarted successfully');
+          this.emit('worker-restarted');
+        } catch (err) {
+          console.error('mediasoup: Worker restart failed:', err.message);
+          this.emit('worker-restart-failed', err);
+        }
+      }, this.workerRestartDelay);
+    } else {
+      console.error(`mediasoup: Max restart attempts (${this.maxWorkerRestarts}) reached`);
+      this.emit('worker-failed', 'max_restarts_exceeded');
+    }
   }
 
   /**
@@ -154,14 +203,52 @@ export class WebRTCService extends EventEmitter {
       listenIps: [{ ip: '0.0.0.0', announcedIp: '127.0.0.1' }]
     });
 
+    // Connection timeout
+    const connectionTimeout = setTimeout(() => {
+      const client = this.clients.get(clientId);
+      if (client && client.transport && !client.transport.closed) {
+        console.warn(`Transport connection timeout for client ${clientId}`);
+        this.removeClient(clientId);
+      }
+    }, this.transportConnectTimeout);
+
+    // DTLS state monitoring
     transport.on('dtlsstatechange', (state) => {
-      if (state === 'closed') {
-        console.log(`Transport closed for client ${clientId}`);
+      if (state === 'connected') {
+        const client = this.clients.get(clientId);
+        if (client?.connectionTimeout) {
+          clearTimeout(client.connectionTimeout);
+          client.connectionTimeout = null;
+        }
+      }
+      if (state === 'closed' || state === 'failed') {
+        console.log(`Transport ${state} for client ${clientId}`);
         this.removeClient(clientId);
       }
     });
 
-    this.clients.set(clientId, { transport, consumer: null });
+    // ICE state monitoring
+    transport.on('icestatechange', (state) => {
+      if (state === 'disconnected') {
+        console.warn(`ICE disconnected for client ${clientId}`);
+        // Give time to reconnect before cleanup
+        setTimeout(() => {
+          const client = this.clients.get(clientId);
+          if (client?.transport?.iceState === 'disconnected') {
+            console.warn(`ICE still disconnected for ${clientId}, removing`);
+            this.removeClient(clientId);
+          }
+        }, 5000);
+      }
+    });
+
+    // Transport error handler
+    transport.on('error', (error) => {
+      console.error(`Transport error for client ${clientId}:`, error.message);
+      this.removeClient(clientId);
+    });
+
+    this.clients.set(clientId, { transport, consumer: null, connectionTimeout });
     console.log(`Created transport for client ${clientId}`);
 
     return {
@@ -231,13 +318,14 @@ export class WebRTCService extends EventEmitter {
   }
 
   /**
-   * Remove client
+   * Remove client and cleanup resources
    */
   removeClient(clientId) {
     const client = this.clients.get(clientId);
     if (client) {
-      if (client.consumer) client.consumer.close();
-      if (client.transport) client.transport.close();
+      if (client.connectionTimeout) clearTimeout(client.connectionTimeout);
+      if (client.consumer && !client.consumer.closed) client.consumer.close();
+      if (client.transport && !client.transport.closed) client.transport.close();
       this.clients.delete(clientId);
       console.log(`Client ${clientId} removed`);
     }

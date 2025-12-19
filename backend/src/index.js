@@ -45,11 +45,17 @@ let streamMode = null; // 'file' or 'udp'
 // Initialize services
 webrtcService = new WebRTCService();
 
-// WebSocket handling
+// WebSocket handling with heartbeat
 wss.on('connection', (ws) => {
   const clientId = randomUUID();
+  ws.isAlive = true;
   clients.set(ws, { id: clientId });
   console.log(`Client connected: ${clientId}`);
+
+  // Heartbeat pong response
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
 
   ws.on('message', async (message) => {
     try {
@@ -73,6 +79,15 @@ wss.on('connection', (ws) => {
     }
   });
 
+  ws.on('error', (error) => {
+    console.error(`WebSocket error for client:`, error.message);
+    const client = clients.get(ws);
+    if (client && webrtcService) {
+      webrtcService.removeClient(client.id);
+    }
+    clients.delete(ws);
+  });
+
   // Send current status
   ws.send(JSON.stringify({
     type: 'status',
@@ -85,6 +100,22 @@ wss.on('connection', (ws) => {
     webrtc: streamMode === 'udp',
     rtpCapabilities: (streamMode === 'udp' && webrtcService?.isReady) ? webrtcService.getRtpCapabilities() : null
   }));
+});
+
+// WebSocket heartbeat interval (30s)
+const heartbeatInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (!ws.isAlive) {
+      console.log('Terminating dead WebSocket connection');
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000);
+
+wss.on('close', () => {
+  clearInterval(heartbeatInterval);
 });
 
 async function handleClientMessage(ws, data) {
@@ -271,14 +302,34 @@ async function startUDPStream(port = 5000) {
 
   // Handle KLV events from GStreamer
   gstreamerService.on('klv', (klvData) => {
-    const { packets } = parseKLV(klvData);
-    for (const packet of packets) {
-      const formatted = formatKLVForDisplay(packet);
-      broadcast({
-        type: 'klv',
-        data: formatted
-      });
+    try {
+      const { packets } = parseKLV(klvData);
+      for (const packet of packets) {
+        const formatted = formatKLVForDisplay(packet);
+        broadcast({
+          type: 'klv',
+          data: formatted
+        });
+      }
+    } catch (error) {
+      console.error('KLV parsing error:', error.message);
     }
+  });
+
+  // Handle GStreamer pipeline errors
+  gstreamerService.on('pipeline-failed', async (reason) => {
+    console.error('GStreamer pipeline failed:', reason);
+    broadcast({ type: 'stream-error', message: 'Pipeline failed: ' + reason });
+    await stopStream();
+  });
+
+  gstreamerService.on('pipeline-stalled', (elapsed) => {
+    console.warn('GStreamer pipeline stalled, attempting recovery');
+    broadcast({ type: 'stream-warning', message: 'Stream stalled, recovering...' });
+  });
+
+  gstreamerService.on('stream-ended', () => {
+    broadcast({ type: 'stream-ended' });
   });
 
   // Start the GStreamer pipeline
@@ -340,24 +391,39 @@ app.get('/api/status', (req, res) => {
   });
 });
 
-app.post('/api/stream/file', (req, res) => {
+app.post('/api/stream/file', async (req, res) => {
   const { file } = req.body;
   if (!file) {
     return res.status(400).json({ error: 'File path required' });
   }
-  startFileStream(file);
-  res.json({ success: true, mode: 'file' });
+  try {
+    await startFileStream(file);
+    res.json({ success: true, mode: 'file' });
+  } catch (error) {
+    console.error('Failed to start file stream:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.post('/api/stream/udp', (req, res) => {
+app.post('/api/stream/udp', async (req, res) => {
   const { port } = req.body;
-  startUDPStream(port || 5000);
-  res.json({ success: true, mode: 'udp', port: port || 5000 });
+  try {
+    await startUDPStream(port || 5000);
+    res.json({ success: true, mode: 'udp', port: port || 5000 });
+  } catch (error) {
+    console.error('Failed to start UDP stream:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.post('/api/stream/stop', (req, res) => {
-  stopStream();
-  res.json({ success: true });
+app.post('/api/stream/stop', async (req, res) => {
+  try {
+    await stopStream();
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Failed to stop stream:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Simulator control
@@ -402,6 +468,10 @@ const SAMPLE_FILES = [
   { id: 'cheyenne', name: 'Cheyenne', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/MISB/Cheyenne.ts' },
   { id: 'falls', name: 'Falls', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/MISB/falls.ts' },
   { id: 'klv_test', name: 'KLV Test Sync', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/MISB/klv_metadata_test_sync.ts' },
+  { id: 'day_flight', name: 'Day Flight', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/Day_Flight.mpg' },
+  { id: 'night_flight', name: 'Night Flight IR', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/Night_Flight_IR.mpg' },
+  { id: 'esri_4k', name: 'Esri 4K MPEG2', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/MISB/Esri_multiplexer_0.mp4' },
+  { id: 'misb_4k', name: 'MISB 4K H264', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/multiplexor/MISB.mp4' },
 ];
 
 app.get('/api/simulator/files', (req, res) => {
@@ -464,4 +534,69 @@ server.listen(PORT, () => {
   console.log(`\nModes:`);
   console.log(`  File:     POST /api/stream/file  { "file": "/path/to/file.ts" }`);
   console.log(`  UDP+RTC:  POST /api/stream/udp   { "port": 5000 }`);
+});
+
+// ===== Graceful Shutdown =====
+let isShuttingDown = false;
+
+async function gracefulShutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+
+  console.log(`\n${signal} received, shutting down gracefully...`);
+
+  // Stop accepting new connections
+  clearInterval(heartbeatInterval);
+
+  // Close all WebSocket connections
+  wss.clients.forEach(ws => {
+    ws.close(1001, 'Server shutting down');
+  });
+
+  // Stop streams
+  try {
+    await stopStream();
+  } catch (error) {
+    console.error('Error stopping streams:', error);
+  }
+
+  // Stop simulator
+  try {
+    await killSimulator();
+  } catch (error) {
+    console.error('Error killing simulator:', error);
+  }
+
+  // Close WebRTC worker
+  if (webrtcService?.worker) {
+    try {
+      webrtcService.worker.close();
+    } catch (error) {
+      console.error('Error closing WebRTC worker:', error);
+    }
+  }
+
+  // Close HTTP server
+  server.close(() => {
+    console.log('HTTP server closed');
+    process.exit(0);
+  });
+
+  // Force exit after timeout
+  setTimeout(() => {
+    console.error('Forced shutdown after timeout');
+    process.exit(1);
+  }, 10000);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception:', error);
+  gracefulShutdown('uncaughtException');
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled rejection:', reason);
 });

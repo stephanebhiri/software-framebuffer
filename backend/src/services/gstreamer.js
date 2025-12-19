@@ -15,6 +15,17 @@ class GStreamerService extends EventEmitter {
     this.pipeline = null;
     this.isRunning = false;
     this.setMaxListeners(10);
+
+    // Restart management
+    this.restartAttempts = 0;
+    this.maxRestartAttempts = 3;
+    this.restartDelay = 2000;
+    this.lastPipelineStr = null;
+
+    // Health monitoring
+    this.lastActivityTime = 0;
+    this.healthCheckInterval = null;
+    this.activityTimeoutMs = 10000;
   }
 
   /**
@@ -23,8 +34,9 @@ class GStreamerService extends EventEmitter {
    * @param {number} rtpPort - RTP port for VP8 output to mediasoup
    */
   startUDP(udpPort, rtpPort) {
-    this.stop();
+    this._stopPipeline();
     this.isRunning = true;
+    this.restartAttempts = 0; // Reset on new start
 
     const pipelineStr = this._buildPipeline(
       `udpsrc port=${udpPort} buffer-size=2097152`,
@@ -41,8 +53,9 @@ class GStreamerService extends EventEmitter {
    * @param {number} rtpPort - RTP port for VP8 output to mediasoup
    */
   startFile(filePath, rtpPort) {
-    this.stop();
+    this._stopPipeline();
     this.isRunning = true;
+    this.restartAttempts = 0; // Reset on new start
 
     const pipelineStr = this._buildPipeline(
       `filesrc location="${filePath}"`,
@@ -82,15 +95,23 @@ class GStreamerService extends EventEmitter {
    * Launch GStreamer pipeline and setup KLV extraction from stdout
    */
   _launchPipeline(pipelineStr) {
+    this.lastPipelineStr = pipelineStr;
+    this.lastActivityTime = Date.now();
+
     this.pipeline = spawn('bash', ['-c', `gst-launch-1.0 -e ${pipelineStr}`], {
       stdio: ['pipe', 'pipe', 'pipe']
     });
 
-    // Stderr: log errors only
+    // Stderr: log errors and detect input issues
     this.pipeline.stderr.on('data', (data) => {
       const msg = data.toString();
       if (msg.includes('ERROR') || msg.includes('CRITICAL')) {
         console.error('GStreamer:', msg.trim().substring(0, 200));
+        this.emit('pipeline-error', msg);
+      }
+      // Detect packet loss / degraded stream
+      if (msg.includes('dropping') || msg.includes('late')) {
+        this.emit('packet-loss', msg.trim().substring(0, 100));
       }
     });
 
@@ -99,12 +120,77 @@ class GStreamerService extends EventEmitter {
 
     this.pipeline.on('close', (code) => {
       console.log(`GStreamer pipeline closed, code: ${code}`);
+      this._clearHealthCheck();
       this.pipeline = null;
+
+      // Auto-restart on unexpected exit
+      if (this.isRunning && code !== 0) {
+        this._attemptRestart();
+      } else if (code === 0) {
+        // Normal end (e.g., file playback finished)
+        this.emit('stream-ended');
+      }
     });
 
     this.pipeline.on('error', (err) => {
-      console.error('GStreamer error:', err.message);
+      console.error('GStreamer spawn error:', err.message);
+      this.emit('pipeline-error', err.message);
     });
+
+    // Start health monitoring
+    this._startHealthCheck();
+  }
+
+  /**
+   * Attempt pipeline restart after failure
+   */
+  _attemptRestart() {
+    if (this.restartAttempts >= this.maxRestartAttempts) {
+      console.error(`GStreamer: Max restart attempts (${this.maxRestartAttempts}) reached`);
+      this.isRunning = false;
+      this.emit('pipeline-failed', 'max_restarts_exceeded');
+      return;
+    }
+
+    this.restartAttempts++;
+    console.log(`GStreamer: Restart attempt ${this.restartAttempts}/${this.maxRestartAttempts} in ${this.restartDelay}ms`);
+
+    setTimeout(() => {
+      if (this.isRunning && this.lastPipelineStr) {
+        console.log('GStreamer: Restarting pipeline...');
+        this._launchPipeline(this.lastPipelineStr);
+      }
+    }, this.restartDelay);
+  }
+
+  /**
+   * Start health monitoring - detect stalled pipelines
+   */
+  _startHealthCheck() {
+    this._clearHealthCheck();
+    this.healthCheckInterval = setInterval(() => {
+      const elapsed = Date.now() - this.lastActivityTime;
+      if (elapsed > this.activityTimeoutMs) {
+        console.warn(`GStreamer: No activity for ${elapsed}ms - pipeline may be stalled`);
+        this.emit('pipeline-stalled', elapsed);
+        // Force restart
+        this._stopPipeline();
+        if (this.isRunning) {
+          this.isRunning = true; // Keep running state for restart
+          this._attemptRestart();
+        }
+      }
+    }, 5000);
+  }
+
+  /**
+   * Clear health check interval
+   */
+  _clearHealthCheck() {
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+      this.healthCheckInterval = null;
+    }
   }
 
   /**
@@ -113,12 +199,13 @@ class GStreamerService extends EventEmitter {
   _setupKLVExtraction() {
     const TS_PACKET_SIZE = 188;
     const SYNC_BYTE = 0x47;
-    const KLV_PIDS = new Set([0x0044, 0x0100, 0x0101, 0x0102, 0x01f1, 0x1000]);
+    const KLV_PIDS = new Set([0x0042, 0x0044, 0x0100, 0x0101, 0x0102, 0x01f1, 0x1000]);
 
     let tsBuffer = Buffer.alloc(0);
     const pesBuffers = new Map();
 
     this.pipeline.stdout.on('data', (chunk) => {
+      this.lastActivityTime = Date.now();
       tsBuffer = Buffer.concat([tsBuffer, chunk]);
 
       // Process complete TS packets
@@ -210,9 +297,9 @@ class GStreamerService extends EventEmitter {
   }
 
   /**
-   * Stop pipeline and cleanup
+   * Stop pipeline only (internal use for restart)
    */
-  stop() {
+  _stopPipeline() {
     this.isRunning = false;
 
     if (this.pipeline) {
@@ -236,7 +323,16 @@ class GStreamerService extends EventEmitter {
 
       this.pipeline = null;
     }
+  }
 
+  /**
+   * Stop pipeline and cleanup all listeners
+   */
+  stop() {
+    this._clearHealthCheck();
+    this._stopPipeline();
+    this.restartAttempts = 0;
+    this.lastPipelineStr = null;
     this.removeAllListeners();
     console.log('GStreamer: Stopped');
   }
