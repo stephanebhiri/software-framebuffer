@@ -12,10 +12,10 @@ import { dirname, join } from 'path';
 import { existsSync, mkdirSync, writeFileSync, readFileSync, unlinkSync } from 'fs';
 import { randomUUID } from 'crypto';
 
-import { spawn, execSync } from 'child_process';
+import { spawn } from 'child_process';
 import { parseKLV, formatKLVForDisplay } from './parsers/klv.js';
 import FFmpegService from './services/ffmpeg.js';
-import UDPReceiver from './services/udp-receiver.js';
+import GStreamerService from './services/gstreamer.js';
 import WebRTCService from './services/webrtc.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -37,12 +37,12 @@ app.use('/hls', express.static(hlsDir));
 // Store active clients and current stream
 const clients = new Map(); // ws -> { id, ... }
 let ffmpegService = null;
-let udpReceiver = null;
+let gstreamerService = null;
 let webrtcService = null;
 let currentSource = null;
 let streamMode = null; // 'file' or 'udp'
 
-// Initialize WebRTC service
+// Initialize services
 webrtcService = new WebRTCService();
 
 // WebSocket handling
@@ -77,7 +77,7 @@ wss.on('connection', (ws) => {
   ws.send(JSON.stringify({
     type: 'status',
     clientId,
-    streaming: !!(ffmpegService || udpReceiver),
+    streaming: !!(ffmpegService || gstreamerService),
     source: currentSource,
     mode: streamMode,
     hlsUrl: (streamMode === 'file' && ffmpegService) ? '/hls/playlist.m3u8' : null,
@@ -248,7 +248,7 @@ async function startFileStream(filePath) {
   });
 }
 
-// ===== UDP STREAM MODE with WebRTC =====
+// ===== UDP STREAM MODE with WebRTC (GStreamer) =====
 async function startUDPStream(port = 5000) {
   console.log('Starting UDP stream on port:', port);
   await stopStream();
@@ -256,23 +256,21 @@ async function startUDPStream(port = 5000) {
   currentSource = `udp://0.0.0.0:${port}`;
   streamMode = 'udp';
 
-  // Initialize WebRTC and start ingest
+  // Initialize WebRTC and get RTP port
+  let rtpPort;
   try {
-    await webrtcService.startIngest();
-    console.log('WebRTC ingest ready');
+    rtpPort = await webrtcService.startIngest();
+    console.log(`WebRTC ingest ready, RTP port: ${rtpPort}`);
   } catch (error) {
     console.error('WebRTC ingest failed:', error);
+    return;
   }
 
-  // Start UDP receiver - it will forward data to WebRTC
-  udpReceiver = new UDPReceiver(port, '0.0.0.0', null);
+  // Start GStreamer pipeline (UDP → VP8/RTP → mediasoup + KLV extraction)
+  gstreamerService = new GStreamerService();
 
-  // Forward raw TS data to WebRTC service for video
-  udpReceiver.on('ts-data', (tsData) => {
-    webrtcService.writeData(tsData);
-  });
-
-  udpReceiver.on('klv', (klvData) => {
+  // Handle KLV events from GStreamer
+  gstreamerService.on('klv', (klvData) => {
     const { packets } = parseKLV(klvData);
     for (const packet of packets) {
       const formatted = formatKLVForDisplay(packet);
@@ -283,12 +281,8 @@ async function startUDPStream(port = 5000) {
     }
   });
 
-  udpReceiver.on('error', (err) => {
-    console.error('UDP error:', err);
-    broadcast({ type: 'error', message: err.message });
-  });
-
-  udpReceiver.start();
+  // Start the GStreamer pipeline
+  gstreamerService.startUDP(port, rtpPort);
 
   broadcast({
     type: 'stream-started',
@@ -321,15 +315,16 @@ async function stopStream() {
     ffmpegService.stop();
     ffmpegService = null;
   }
-  if (udpReceiver) {
-    udpReceiver.stop();
-    udpReceiver = null;
+  if (gstreamerService) {
+    gstreamerService.stop();
+    gstreamerService = null;
   }
   if (webrtcService?.producer) {
     await webrtcService.stop();
     // Reinitialize for next use
     webrtcService = new WebRTCService();
   }
+  currentSource = null;
   streamMode = null;
   broadcast({ type: 'stream-stopped' });
 }
@@ -337,7 +332,7 @@ async function stopStream() {
 // REST API
 app.get('/api/status', (req, res) => {
   res.json({
-    streaming: !!(ffmpegService || udpReceiver),
+    streaming: !!(ffmpegService || gstreamerService),
     source: currentSource,
     mode: streamMode,
     clients: clients.size,

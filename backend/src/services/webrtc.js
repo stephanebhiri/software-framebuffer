@@ -1,9 +1,9 @@
 /**
  * WebRTC Service using mediasoup
- * Handles video streaming from UDP to browsers via WebRTC
+ * Handles video streaming to browsers via WebRTC
+ * Video input comes from GStreamer via RTP
  */
 import * as mediasoup from 'mediasoup';
-import { spawn } from 'child_process';
 import { EventEmitter } from 'events';
 
 // mediasoup configuration
@@ -53,8 +53,8 @@ export class WebRTCService extends EventEmitter {
     this.producer = null;
     this.plainTransport = null;
     this.clients = new Map(); // clientId -> { transport, consumer }
-    this.ffmpeg = null;
     this.isReady = false;
+    this.rtpPort = null;
   }
 
   /**
@@ -92,7 +92,8 @@ export class WebRTCService extends EventEmitter {
   }
 
   /**
-   * Start video ingest - returns a writable stream for TS data
+   * Start video ingest - creates RTP transport for GStreamer to send to
+   * @returns {number} RTP port that GStreamer should send VP8 RTP to
    */
   async startIngest() {
     if (!this.router) {
@@ -101,14 +102,15 @@ export class WebRTCService extends EventEmitter {
 
     console.log('Starting WebRTC video ingest...');
 
-    // Create plain RTP transport for FFmpeg input
+    // Create plain RTP transport for GStreamer input
     this.plainTransport = await this.router.createPlainTransport({
       listenIp: { ip: '127.0.0.1', announcedIp: null },
       rtcpMux: false,
       comedia: true
     });
 
-    console.log(`Plain transport: RTP port ${this.plainTransport.tuple.localPort}`);
+    this.rtpPort = this.plainTransport.tuple.localPort;
+    console.log(`Plain transport: RTP port ${this.rtpPort}`);
 
     // Create producer for video
     this.producer = await this.plainTransport.produce({
@@ -126,77 +128,17 @@ export class WebRTCService extends EventEmitter {
     });
 
     console.log(`Producer created: ${this.producer.id}`);
-
-    // Start FFmpeg to transcode piped TS to RTP VP8
-    const rtpPort = this.plainTransport.tuple.localPort;
-    this.startFFmpeg(rtpPort);
-
     this.emit('producer-ready', this.producer.id);
 
-    // Return stdin for piping data
-    return this.ffmpeg?.stdin;
+    // Return the RTP port for GStreamer to send to
+    return this.rtpPort;
   }
 
   /**
-   * Start FFmpeg process - reads from stdin, outputs RTP to mediasoup
+   * Get the RTP port for GStreamer
    */
-  startFFmpeg(rtpPort) {
-    const rtpTarget = `rtp://127.0.0.1:${rtpPort}`;
-
-    console.log(`Starting FFmpeg transcoder -> ${rtpTarget}`);
-
-    this.ffmpeg = spawn('ffmpeg', [
-      '-fflags', '+genpts',
-      '-f', 'mpegts',
-      '-i', 'pipe:0',           // Read from stdin
-      '-map', '0:v:0?',          // Map first video stream if exists
-      '-c:v', 'libvpx',
-      '-deadline', 'realtime',
-      '-cpu-used', '8',
-      '-b:v', '1M',
-      '-g', '30',
-      '-an',                     // No audio
-      '-f', 'rtp',
-      '-ssrc', '22222222',
-      '-payload_type', '96',
-      rtpTarget
-    ], {
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-
-    this.ffmpeg.stderr.on('data', (data) => {
-      const msg = data.toString();
-      if (msg.includes('frame=')) {
-        // Progress update
-        if (Math.random() < 0.02) {
-          console.log('FFmpeg:', msg.trim().slice(0, 60));
-        }
-      } else if (msg.includes('Error') || msg.includes('error')) {
-        console.error('FFmpeg error:', msg.trim());
-      } else if (msg.includes('Output')) {
-        console.log('FFmpeg output started');
-      }
-    });
-
-    this.ffmpeg.on('close', (code) => {
-      console.log('FFmpeg exited with code:', code);
-      this.ffmpeg = null;
-    });
-
-    this.ffmpeg.on('error', (err) => {
-      console.error('FFmpeg spawn error:', err);
-    });
-  }
-
-  /**
-   * Write TS data to FFmpeg
-   */
-  writeData(data) {
-    if (this.ffmpeg?.stdin?.writable) {
-      this.ffmpeg.stdin.write(data);
-      return true;
-    }
-    return false;
+  getRtpPort() {
+    return this.rtpPort;
   }
 
   /**
@@ -305,37 +247,38 @@ export class WebRTCService extends EventEmitter {
    * Stop the service
    */
   async stop() {
-    if (this.ffmpeg) {
-      this.ffmpeg.stdin.end();
-      this.ffmpeg.kill('SIGTERM');
-      this.ffmpeg = null;
-    }
-
+    // Close producer
     if (this.producer) {
       this.producer.close();
       this.producer = null;
     }
 
+    // Close RTP transport
     if (this.plainTransport) {
       this.plainTransport.close();
       this.plainTransport = null;
     }
+    this.rtpPort = null;
 
+    // Close all client transports
     for (const [clientId] of this.clients) {
       this.removeClient(clientId);
     }
 
+    // Close router
     if (this.router) {
       this.router.close();
       this.router = null;
     }
 
+    // Close worker
     if (this.worker) {
       this.worker.close();
       this.worker = null;
     }
 
     this.isReady = false;
+    this.removeAllListeners();
     console.log('WebRTC service stopped');
   }
 }
