@@ -33,18 +33,22 @@ class GStreamerService extends EventEmitter {
    * @param {number} udpPort - UDP port for MPEG-TS input
    * @param {number} rtpPort - RTP port for VP8 output to mediasoup
    */
-  startUDP(udpPort, rtpPort) {
+  startUDP(udpPort, rtpPort, decoder = 'avdec_h264') {
     this._stopPipeline();
     this.isRunning = true;
     this.restartAttempts = 0; // Reset on new start
+    this.currentDecoder = decoder;
+    this.udpPort = udpPort;
+    this.rtpPort = rtpPort;
 
     const pipelineStr = this._buildPipeline(
       `udpsrc port=${udpPort} buffer-size=2097152`,
-      rtpPort
+      rtpPort,
+      decoder
     );
 
     this._launchPipeline(pipelineStr);
-    console.log(`GStreamer: UDP started on :${udpPort} → RTP :${rtpPort}`);
+    console.log(`GStreamer: UDP started on :${udpPort} → RTP :${rtpPort} (${decoder})`);
   }
 
   /**
@@ -69,8 +73,9 @@ class GStreamerService extends EventEmitter {
   /**
    * Build GStreamer pipeline string
    * Single pipeline with tee: one branch for video, one for raw TS (KLV extraction)
+   * @param {string} decoder - Video decoder to use (avdec_h264 or avdec_mpeg2video)
    */
-  _buildPipeline(source, rtpPort) {
+  _buildPipeline(source, rtpPort, decoder = 'avdec_h264') {
     return `
       ${source}
       ! tee name=t
@@ -78,8 +83,7 @@ class GStreamerService extends EventEmitter {
          ! tsparse set-timestamps=true
          ! tsdemux latency=100
          ! queue max-size-buffers=100 max-size-time=500000000 leaky=downstream
-         ! h264parse
-         ! avdec_h264 output-corrupt=true
+         ! ${decoder}
          ! videoconvert
          ! videoscale
          ! video/x-raw,width=1280,height=720
@@ -143,6 +147,7 @@ class GStreamerService extends EventEmitter {
 
   /**
    * Attempt pipeline restart after failure
+   * On first failure, try switching decoder (H264 ↔ MPEG2)
    */
   _attemptRestart() {
     if (this.restartAttempts >= this.maxRestartAttempts) {
@@ -153,6 +158,19 @@ class GStreamerService extends EventEmitter {
     }
 
     this.restartAttempts++;
+
+    // On first failure, try alternate decoder
+    if (this.restartAttempts === 1 && this.udpPort && this.rtpPort) {
+      const altDecoder = this.currentDecoder === 'avdec_h264' ? 'avdec_mpeg2video' : 'avdec_h264';
+      console.log(`GStreamer: Trying alternate decoder: ${altDecoder}`);
+      this.currentDecoder = altDecoder;
+      this.lastPipelineStr = this._buildPipeline(
+        `udpsrc port=${this.udpPort} buffer-size=2097152`,
+        this.rtpPort,
+        altDecoder
+      );
+    }
+
     console.log(`GStreamer: Restart attempt ${this.restartAttempts}/${this.maxRestartAttempts} in ${this.restartDelay}ms`);
 
     setTimeout(() => {

@@ -332,8 +332,9 @@ async function startUDPStream(port = 5000) {
     broadcast({ type: 'stream-ended' });
   });
 
-  // Start the GStreamer pipeline
-  gstreamerService.startUDP(port, rtpPort);
+  // Start the GStreamer pipeline with appropriate decoder
+  const decoder = simulatorCodec === 'mpeg2' ? 'avdec_mpeg2video' : 'avdec_h264';
+  gstreamerService.startUDP(port, rtpPort, decoder);
 
   broadcast({
     type: 'stream-started',
@@ -428,6 +429,7 @@ app.post('/api/stream/stop', async (req, res) => {
 
 // Simulator control
 let simulatorProcess = null;
+let simulatorCodec = 'h264'; // Current simulator video codec
 const SIMULATOR_PID_FILE = join(__dirname, '../.simulator.pid');
 
 function killSimulator() {
@@ -465,13 +467,13 @@ function killSimulator() {
 }
 
 const SAMPLE_FILES = [
-  { id: 'cheyenne', name: 'Cheyenne', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/MISB/Cheyenne.ts' },
-  { id: 'falls', name: 'Falls', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/MISB/falls.ts' },
-  { id: 'klv_test', name: 'KLV Test Sync', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/MISB/klv_metadata_test_sync.ts' },
-  { id: 'day_flight', name: 'Day Flight', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/Day_Flight.mpg' },
-  { id: 'night_flight', name: 'Night Flight IR', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/Night_Flight_IR.mpg' },
-  { id: 'esri_4k', name: 'Esri 4K MPEG2', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/MISB/Esri_multiplexer_0.mp4' },
-  { id: 'misb_4k', name: 'MISB 4K H264', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/multiplexor/MISB.mp4' },
+  { id: 'cheyenne', name: 'Cheyenne', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/MISB/Cheyenne.ts', codec: 'h264' },
+  { id: 'falls', name: 'Falls', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/MISB/falls.ts', codec: 'h264' },
+  { id: 'klv_test', name: 'KLV Test Sync', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/MISB/klv_metadata_test_sync.ts', codec: 'h264' },
+  { id: 'day_flight', name: 'Day Flight', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/Day_Flight.mpg', codec: 'h264' },
+  { id: 'night_flight', name: 'Night Flight IR', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/Night_Flight_IR.mpg', codec: 'h264' },
+  { id: 'esri_4k', name: 'Esri 4K MPEG2', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/MISB/Esri_multiplexer_0.mp4', codec: 'mpeg2' },
+  { id: 'misb_4k', name: 'MISB 4K H264', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/multiplexor/MISB.mp4', codec: 'h264' },
 ];
 
 app.get('/api/simulator/files', (req, res) => {
@@ -516,10 +518,11 @@ app.post('/api/simulator/start', async (req, res) => {
     if (existsSync(SIMULATOR_PID_FILE)) unlinkSync(SIMULATOR_PID_FILE);
   });
 
-  // Save PID for orphan recovery
+  // Save PID and codec for orphan recovery
   writeFileSync(SIMULATOR_PID_FILE, String(simulatorProcess.pid));
-  console.log(`Simulator started: ${file.name} -> udp://127.0.0.1:${port} (PID: ${simulatorProcess.pid})`);
-  res.json({ success: true, file: file.name, port });
+  simulatorCodec = file.codec || 'h264';
+  console.log(`Simulator started: ${file.name} -> udp://127.0.0.1:${port} (PID: ${simulatorProcess.pid}, codec: ${simulatorCodec})`);
+  res.json({ success: true, file: file.name, port, codec: simulatorCodec });
 });
 
 app.post('/api/simulator/stop', async (req, res) => {
