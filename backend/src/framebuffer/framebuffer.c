@@ -281,10 +281,10 @@ static FrameBuffer *framebuffer_new(void) {
 static gboolean create_input_pipeline(FrameBuffer *fb) {
     fb->input_pipeline = gst_pipeline_new("input-pipeline");
 
-    // Create elements - using decodebin for codec-agnostic decoding
+    // Create elements - using decodebin3 for dynamic codec switching
     GstElement *udpsrc = gst_element_factory_make("udpsrc", "udpsrc");
     GstElement *tsdemux = gst_element_factory_make("tsdemux", "tsdemux");
-    GstElement *decodebin = gst_element_factory_make("decodebin", "decodebin");
+    GstElement *decodebin = gst_element_factory_make("decodebin3", "decodebin");
     GstElement *videoconvert = gst_element_factory_make("videoconvert", "videoconvert");
     GstElement *videoscale = gst_element_factory_make("videoscale", "videoscale");
     GstElement *capsfilter = gst_element_factory_make("capsfilter", "capsfilter");
