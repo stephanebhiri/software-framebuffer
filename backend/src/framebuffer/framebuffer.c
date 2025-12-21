@@ -80,8 +80,11 @@ static void on_bus_error(GstBus *bus, GstMessage *msg, gpointer data) {
  * Context for safe source switching via pad probe
  */
 typedef struct {
-    GstPad *new_pad;   // New video/x-h264 pad from tsdemux
+    GstPad *new_pad;   // New video pad from tsdemux (any codec)
 } SwitchContext;
+
+// Forward declaration for decodebin callback
+static void on_decodebin_pad_added(GstElement *decodebin, GstPad *pad, gpointer data);
 
 /**
  * Pad probe callback for safe source switching
@@ -121,6 +124,49 @@ on_switch_blocked(GstPad *qsink,
 }
 
 /**
+ * Check if caps represent a video format (any codec)
+ */
+static gboolean is_video_caps(const gchar *caps_name) {
+    return (g_str_has_prefix(caps_name, "video/x-h264") ||
+            g_str_has_prefix(caps_name, "video/x-h265") ||
+            g_str_has_prefix(caps_name, "video/mpeg") ||
+            g_str_has_prefix(caps_name, "video/x-vp8") ||
+            g_str_has_prefix(caps_name, "video/x-vp9") ||
+            g_str_has_prefix(caps_name, "video/x-av1") ||
+            g_str_has_prefix(caps_name, "video/x-raw"));
+}
+
+/**
+ * Callback when decodebin creates a src pad (decoded video ready)
+ */
+static void on_decodebin_pad_added(GstElement *decodebin, GstPad *pad, gpointer data) {
+    GstElement *videoconvert = (GstElement *)data;
+
+    GstCaps *caps = gst_pad_get_current_caps(pad);
+    if (!caps) caps = gst_pad_query_caps(pad, NULL);
+    if (!caps) return;
+
+    const GstStructure *s = gst_caps_get_structure(caps, 0);
+    const gchar *name = gst_structure_get_name(s);
+
+    // Only link video/x-raw pads (decoded video)
+    if (g_str_has_prefix(name, "video/x-raw")) {
+        GstPad *sink_pad = gst_element_get_static_pad(videoconvert, "sink");
+        if (sink_pad && !gst_pad_is_linked(sink_pad)) {
+            GstPadLinkReturn ret = gst_pad_link(pad, sink_pad);
+            if (ret == GST_PAD_LINK_OK) {
+                g_print("[FrameBuffer] Linked decodebin to videoconvert\n");
+            } else {
+                g_printerr("[FrameBuffer] Failed to link decodebin: %d\n", ret);
+            }
+        }
+        if (sink_pad) gst_object_unref(sink_pad);
+    }
+
+    gst_caps_unref(caps);
+}
+
+/**
  * Helper to link a pad to a new fakesink
  */
 static void link_pad_to_fakesink(GstElement *demux, GstPad *pad) {
@@ -144,9 +190,10 @@ static void link_pad_to_fakesink(GstElement *demux, GstPad *pad) {
 
 /**
  * Handle new pads from tsdemux - safe source switching with pad probe blocking
+ * Now codec-agnostic: accepts H.264, H.265/HEVC, MPEG-2, etc.
  */
 static void on_demux_pad_added(GstElement *demux, GstPad *pad, gpointer data) {
-    GstElement *queue = (GstElement *)data;
+    GstElement *decodebin = (GstElement *)data;
 
     GstCaps *caps = gst_pad_get_current_caps(pad);
     if (!caps) caps = gst_pad_query_caps(pad, NULL);
@@ -159,12 +206,12 @@ static void on_demux_pad_added(GstElement *demux, GstPad *pad, gpointer data) {
 
     gboolean handled = FALSE;
 
-    // For video/x-h264: link to decode chain (with safe switching if needed)
-    if (g_strcmp0(name, "video/x-h264") == 0) {
-        GstPad *qsink = gst_element_get_static_pad(queue, "sink");
+    // For ANY video format: link to decodebin (with safe switching if needed)
+    if (is_video_caps(name)) {
+        GstPad *dbsink = gst_element_get_static_pad(decodebin, "sink");
 
-        if (qsink) {
-            if (gst_pad_is_linked(qsink)) {
+        if (dbsink) {
+            if (gst_pad_is_linked(dbsink)) {
                 // Already linked - schedule safe source switch via pad probe
                 SwitchContext *ctx = g_new0(SwitchContext, 1);
                 ctx->new_pad = gst_object_ref(pad);
@@ -174,7 +221,7 @@ static void on_demux_pad_added(GstElement *demux, GstPad *pad, gpointer data) {
                 // Use IDLE probe - fires when pad is idle, doesn't require data flow
                 // This handles the case where old source stops before probe fires
                 gst_pad_add_probe(
-                    qsink,
+                    dbsink,
                     GST_PAD_PROBE_TYPE_IDLE,
                     on_switch_blocked,
                     ctx,
@@ -183,7 +230,7 @@ static void on_demux_pad_added(GstElement *demux, GstPad *pad, gpointer data) {
                 handled = TRUE;
             } else {
                 // First-time link (no need to block)
-                GstPadLinkReturn ret = gst_pad_link(pad, qsink);
+                GstPadLinkReturn ret = gst_pad_link(pad, dbsink);
                 if (ret == GST_PAD_LINK_OK) {
                     g_print("[FrameBuffer] Linked initial video pad\n");
                     handled = TRUE;
@@ -192,7 +239,7 @@ static void on_demux_pad_added(GstElement *demux, GstPad *pad, gpointer data) {
                 }
             }
 
-            gst_object_unref(qsink);
+            gst_object_unref(dbsink);
         }
     }
 
@@ -229,23 +276,22 @@ static FrameBuffer *framebuffer_new(void) {
 /**
  * Create input pipeline: UDP/MPEG-TS -> decode -> appsink
  * Built programmatically with manual pad-added handling for tsdemux
+ * Now codec-agnostic using decodebin for automatic decoder selection
  */
 static gboolean create_input_pipeline(FrameBuffer *fb) {
     fb->input_pipeline = gst_pipeline_new("input-pipeline");
 
-    // Create elements
+    // Create elements - using decodebin for codec-agnostic decoding
     GstElement *udpsrc = gst_element_factory_make("udpsrc", "udpsrc");
     GstElement *tsdemux = gst_element_factory_make("tsdemux", "tsdemux");
-    GstElement *queue = gst_element_factory_make("queue", "queue");
-    GstElement *h264parse = gst_element_factory_make("h264parse", "h264parse");
-    GstElement *decoder = gst_element_factory_make("avdec_h264", "decoder");
+    GstElement *decodebin = gst_element_factory_make("decodebin", "decodebin");
     GstElement *videoconvert = gst_element_factory_make("videoconvert", "videoconvert");
     GstElement *videoscale = gst_element_factory_make("videoscale", "videoscale");
     GstElement *capsfilter = gst_element_factory_make("capsfilter", "capsfilter");
     fb->appsink = gst_element_factory_make("appsink", "sink");
 
-    if (!udpsrc || !tsdemux || !queue || !h264parse ||
-        !decoder || !videoconvert || !videoscale || !capsfilter || !fb->appsink) {
+    if (!udpsrc || !tsdemux || !decodebin ||
+        !videoconvert || !videoscale || !capsfilter || !fb->appsink) {
         g_printerr("[FrameBuffer] Failed to create input elements\n");
         return FALSE;
     }
@@ -259,15 +305,6 @@ static gboolean create_input_pipeline(FrameBuffer *fb) {
         "caps", src_caps,
         NULL);
     gst_caps_unref(src_caps);
-
-    // Configure queue
-    g_object_set(queue,
-        "max-size-buffers", 30,
-        "leaky", 2,  // downstream
-        NULL);
-
-    // Configure decoder
-    g_object_set(decoder, "output-corrupt", TRUE, NULL);
 
     // Configure capsfilter
     gchar *caps_str = g_strdup_printf(
@@ -288,7 +325,7 @@ static gboolean create_input_pipeline(FrameBuffer *fb) {
 
     // Add elements to pipeline
     gst_bin_add_many(GST_BIN(fb->input_pipeline),
-        udpsrc, tsdemux, queue, h264parse, decoder,
+        udpsrc, tsdemux, decodebin,
         videoconvert, videoscale, capsfilter, fb->appsink, NULL);
 
     // Link static elements: udpsrc -> tsdemux
@@ -297,15 +334,17 @@ static gboolean create_input_pipeline(FrameBuffer *fb) {
         return FALSE;
     }
 
-    // Link post-demux chain: queue -> h264parse -> decoder -> videoconvert -> videoscale -> capsfilter -> appsink
-    if (!gst_element_link_many(queue, h264parse, decoder, videoconvert,
-                               videoscale, capsfilter, fb->appsink, NULL)) {
-        g_printerr("[FrameBuffer] Failed to link decode chain\n");
+    // Link post-decode chain: videoconvert -> videoscale -> capsfilter -> appsink
+    if (!gst_element_link_many(videoconvert, videoscale, capsfilter, fb->appsink, NULL)) {
+        g_printerr("[FrameBuffer] Failed to link post-decode chain\n");
         return FALSE;
     }
 
-    // Connect to tsdemux's pad-added signal for dynamic linking
-    g_signal_connect(tsdemux, "pad-added", G_CALLBACK(on_demux_pad_added), queue);
+    // Connect to tsdemux's pad-added signal for dynamic linking to decodebin
+    g_signal_connect(tsdemux, "pad-added", G_CALLBACK(on_demux_pad_added), decodebin);
+
+    // Connect to decodebin's pad-added signal to link decoded video to videoconvert
+    g_signal_connect(decodebin, "pad-added", G_CALLBACK(on_decodebin_pad_added), videoconvert);
 
     // Connect appsink signal
     g_signal_connect(fb->appsink, "new-sample", G_CALLBACK(on_new_sample), fb);
