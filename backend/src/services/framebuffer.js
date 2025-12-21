@@ -1,0 +1,184 @@
+/**
+ * FrameBuffer Service
+ * Manages the C framebuffer process for ultra-stable video frame synchronization
+ * Provides decoupled input/output with rock-solid timing
+ */
+import { spawn } from 'child_process';
+import { EventEmitter } from 'events';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+import { existsSync } from 'fs';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+export class FrameBufferService extends EventEmitter {
+  constructor() {
+    super();
+    this.process = null;
+    this.isRunning = false;
+    this.stats = {
+      framesIn: 0,
+      framesOut: 0,
+      framesRepeated: 0
+    };
+    this.config = {
+      inputPort: 5001,
+      outputPort: 5002,
+      outputHost: '127.0.0.1',
+      width: 640,
+      height: 480,
+      fps: 25,
+      bitrate: 2000
+    };
+  }
+
+  /**
+   * Get path to framebuffer binary
+   */
+  getBinaryPath() {
+    const paths = [
+      join(__dirname, '../../bin/framebuffer'),
+      join(__dirname, '../framebuffer/framebuffer')
+    ];
+
+    for (const p of paths) {
+      if (existsSync(p)) {
+        return p;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Start the framebuffer process
+   * @param {object} options - Configuration options
+   */
+  async start(options = {}) {
+    if (this.isRunning) {
+      console.log('FrameBuffer: Already running');
+      return;
+    }
+
+    const binaryPath = this.getBinaryPath();
+    if (!binaryPath) {
+      throw new Error('FrameBuffer binary not found. Build it with: cd backend/src/framebuffer && make');
+    }
+
+    // Merge options
+    Object.assign(this.config, options);
+
+    const args = [
+      '-i', String(this.config.inputPort),
+      '-o', String(this.config.outputPort),
+      '-H', this.config.outputHost,
+      '-w', String(this.config.width),
+      '-h', String(this.config.height),
+      '-f', String(this.config.fps),
+      '-b', String(this.config.bitrate)
+    ];
+
+    console.log(`FrameBuffer: Starting ${binaryPath} ${args.join(' ')}`);
+
+    this.process = spawn(binaryPath, args, {
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+
+    this.process.stdout.on('data', (data) => {
+      const lines = data.toString().split('\n').filter(l => l.trim());
+      for (const line of lines) {
+        // Parse stats from output
+        const statsMatch = line.match(/Stats: in=(\d+) out=(\d+) repeated=(\d+)/);
+        if (statsMatch) {
+          this.stats.framesIn = parseInt(statsMatch[1]);
+          this.stats.framesOut = parseInt(statsMatch[2]);
+          this.stats.framesRepeated = parseInt(statsMatch[3]);
+          this.emit('stats', this.stats);
+        }
+
+        // Log important messages
+        if (line.includes('[FrameBuffer]')) {
+          console.log(line);
+        }
+      }
+    });
+
+    this.process.stderr.on('data', (data) => {
+      const msg = data.toString().trim();
+      if (msg) {
+        console.error('[FrameBuffer ERR]', msg);
+      }
+    });
+
+    this.process.on('close', (code) => {
+      console.log(`FrameBuffer: Process exited with code ${code}`);
+      this.isRunning = false;
+      this.process = null;
+      this.emit('closed', code);
+    });
+
+    this.process.on('error', (err) => {
+      console.error('FrameBuffer: Process error:', err.message);
+      this.emit('error', err);
+    });
+
+    this.isRunning = true;
+
+    // Wait for the process to initialize
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    console.log('FrameBuffer: Started');
+    this.emit('started');
+  }
+
+  /**
+   * Stop the framebuffer process
+   */
+  async stop() {
+    if (!this.process) {
+      return;
+    }
+
+    console.log('FrameBuffer: Stopping');
+
+    this.process.kill('SIGTERM');
+
+    // Wait for graceful shutdown
+    await new Promise(resolve => setTimeout(resolve, 500));
+
+    if (this.process && !this.process.killed) {
+      this.process.kill('SIGKILL');
+    }
+
+    this.process = null;
+    this.isRunning = false;
+    this.stats = { framesIn: 0, framesOut: 0, framesRepeated: 0 };
+    console.log('FrameBuffer: Stopped');
+  }
+
+  /**
+   * Get current status
+   */
+  getStatus() {
+    return {
+      running: this.isRunning,
+      config: this.config,
+      stats: this.stats
+    };
+  }
+
+  /**
+   * Get the output port (for WebRTC pipeline to connect to)
+   */
+  getOutputPort() {
+    return this.config.outputPort;
+  }
+
+  /**
+   * Get the input port (for upstream to send to)
+   */
+  getInputPort() {
+    return this.config.inputPort;
+  }
+}
+
+export default FrameBufferService;
