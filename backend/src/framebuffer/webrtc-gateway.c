@@ -486,18 +486,21 @@ static gboolean bus_callback(GstBus *bus, GstMessage *message, gpointer user_dat
 
 /*
  * Create the GStreamer pipeline
+ * FULL pipeline: UDP MPEG-TS -> decode -> encode VP8 -> WebRTC
+ * NO intermediate UDP hop - everything in one process for zero jitter
  */
 static gboolean create_pipeline(void) {
     GError *error = NULL;
 
-    // Pipeline: udpsrc → rtpjitterbuffer → rtpvp8depay → rtpvp8pay (re-timestamp) → webrtcbin
-    // Passthrough VP8 sans ré-encodage, mais avec re-timestamp pour WebRTC
+    // FULL pipeline: udpsrc (MPEG-TS) → decodebin3 → vp8enc → rtpvp8pay → webrtcbin
+    // Uses decodebin3 which handles dynamic pads automatically
+    // NO intermediate UDP hop - everything in one process for zero jitter
+    // Read VP8 RTP from FrameBuffer output (already encoded, smooth timing)
+    // FrameBuffer handles decode + 1s buffer + VP8 encode at stable framerate
     gchar *pipeline_str = g_strdup_printf(
-        "udpsrc port=%d caps=\"application/x-rtp,media=video,encoding-name=VP8,payload=96,clock-rate=90000\" "
-        "! rtpjitterbuffer latency=100 do-retransmission=false "
-        "! rtpvp8depay "
-        "! rtpvp8pay pt=96 picture-id-mode=2 "
-        "! application/x-rtp,media=video,encoding-name=VP8,payload=96,clock-rate=90000 "
+        "udpsrc port=%d buffer-size=2097152 "
+        "caps=\"application/x-rtp,media=video,encoding-name=VP8,payload=96,clock-rate=90000\" "
+        "! queue max-size-buffers=30 "
         "! webrtcbin name=webrtcbin bundle-policy=max-bundle stun-server=%s",
         gateway->udp_port,
         gateway->stun_server
@@ -556,9 +559,13 @@ int main(int argc, char *argv[]) {
     // Initialize GStreamer
     gst_init(&argc, &argv);
 
-    // Create gateway structure
+    // Create gateway structure with defaults
     gateway = g_new0(WebRTCGateway, 1);
-    gateway->udp_port = 5002;
+    gateway->udp_port = 5000;
+    gateway->width = 640;
+    gateway->height = 480;
+    gateway->fps = 25;
+    gateway->bitrate = 2000;
     gateway->stun_server = g_strdup("stun://stun.l.google.com:19302");
     gateway->negotiation_needed = FALSE;
 
@@ -566,6 +573,12 @@ int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
             gateway->udp_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
+            gateway->width = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-h") == 0 && i + 1 < argc) {
+            gateway->height = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
+            gateway->bitrate = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             g_free(gateway->stun_server);
             gateway->stun_server = g_strdup(argv[++i]);

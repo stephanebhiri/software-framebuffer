@@ -50,8 +50,6 @@ typedef struct {
     gint bitrate;
     gboolean raw_output;  // Output raw video instead of H.264 MPEG-TS
     gboolean vp8_output;  // Output VP8 RTP (for direct WebRTC)
-    gboolean shm_output;  // Output raw I420 via shared memory (for webrtc-gateway)
-    gchar *shm_path;      // Shared memory socket path
 
     GMainLoop *loop;
 } FrameBuffer;
@@ -87,19 +85,8 @@ typedef struct {
     GstPad *new_pad;   // New video pad from tsdemux (any codec)
 } SwitchContext;
 
-// Forward declarations
-static void on_demux_pad_added(GstElement *demux, GstPad *pad, gpointer data);
-
-/**
- * Configure decoder properties for optimal performance
- */
-static void configure_decoder(GstElement *decoder, const gchar *codec_name) {
-    // Enable multi-threading for FFmpeg decoders
-    if (g_object_class_find_property(G_OBJECT_GET_CLASS(decoder), "max-threads")) {
-        g_object_set(decoder, "max-threads", 0, NULL);
-        g_print("[FrameBuffer] Enabled multi-threading on %s\n", codec_name);
-    }
-}
+// Forward declaration for decodebin callback
+static void on_decodebin_pad_added(GstElement *decodebin, GstPad *pad, gpointer data);
 
 /**
  * Pad probe callback for safe source switching
@@ -152,6 +139,36 @@ static gboolean is_video_caps(const gchar *caps_name) {
 }
 
 /**
+ * Callback when decodebin creates a src pad (decoded video ready)
+ */
+static void on_decodebin_pad_added(GstElement *decodebin, GstPad *pad, gpointer data) {
+    GstElement *videoconvert = (GstElement *)data;
+
+    GstCaps *caps = gst_pad_get_current_caps(pad);
+    if (!caps) caps = gst_pad_query_caps(pad, NULL);
+    if (!caps) return;
+
+    const GstStructure *s = gst_caps_get_structure(caps, 0);
+    const gchar *name = gst_structure_get_name(s);
+
+    // Only link video/x-raw pads (decoded video)
+    if (g_str_has_prefix(name, "video/x-raw")) {
+        GstPad *sink_pad = gst_element_get_static_pad(videoconvert, "sink");
+        if (sink_pad && !gst_pad_is_linked(sink_pad)) {
+            GstPadLinkReturn ret = gst_pad_link(pad, sink_pad);
+            if (ret == GST_PAD_LINK_OK) {
+                g_print("[FrameBuffer] Linked decodebin to videoconvert\n");
+            } else {
+                g_printerr("[FrameBuffer] Failed to link decodebin: %d\n", ret);
+            }
+        }
+        if (sink_pad) gst_object_unref(sink_pad);
+    }
+
+    gst_caps_unref(caps);
+}
+
+/**
  * Helper to link a pad to a new fakesink
  */
 static void link_pad_to_fakesink(GstElement *demux, GstPad *pad) {
@@ -174,19 +191,15 @@ static void link_pad_to_fakesink(GstElement *demux, GstPad *pad) {
 }
 
 /**
- * Handle new pads from tsdemux - create explicit decoder based on codec
- * Uses avdec_mpeg2video for MPEG2, avdec_h264 for H.264, etc.
+ * Handle new pads from tsdemux - safe source switching with pad probe blocking
+ * Now codec-agnostic: accepts H.264, H.265/HEVC, MPEG-2, etc.
  */
 static void on_demux_pad_added(GstElement *demux, GstPad *pad, gpointer data) {
-    GstElement *videoconvert = (GstElement *)data;
-    GstElement *pipeline = GST_ELEMENT(gst_element_get_parent(demux));
+    GstElement *decodebin = (GstElement *)data;
 
     GstCaps *caps = gst_pad_get_current_caps(pad);
     if (!caps) caps = gst_pad_query_caps(pad, NULL);
-    if (!caps) {
-        if (pipeline) gst_object_unref(pipeline);
-        return;
-    }
+    if (!caps) return;
 
     const GstStructure *s = gst_caps_get_structure(caps, 0);
     const gchar *name = gst_structure_get_name(s);
@@ -195,71 +208,49 @@ static void on_demux_pad_added(GstElement *demux, GstPad *pad, gpointer data) {
 
     gboolean handled = FALSE;
 
+    // For ANY video format: link to decodebin (with safe switching if needed)
     if (is_video_caps(name)) {
-        GstElement *decoder = NULL;
-        const gchar *decoder_name = NULL;
+        GstPad *dbsink = gst_element_get_static_pad(decodebin, "sink");
 
-        // Select explicit decoder based on codec
-        if (g_strcmp0(name, "video/mpeg") == 0) {
-            gint mpegversion = 0;
-            gst_structure_get_int(s, "mpegversion", &mpegversion);
-            if (mpegversion == 2) {
-                decoder = gst_element_factory_make("avdec_mpeg2video", "decoder");
-                decoder_name = "avdec_mpeg2video";
-            } else if (mpegversion == 4) {
-                decoder = gst_element_factory_make("avdec_mpeg4", "decoder");
-                decoder_name = "avdec_mpeg4";
-            }
-        } else if (g_strcmp0(name, "video/x-h264") == 0) {
-            decoder = gst_element_factory_make("avdec_h264", "decoder");
-            decoder_name = "avdec_h264";
-        } else if (g_strcmp0(name, "video/x-h265") == 0) {
-            decoder = gst_element_factory_make("avdec_h265", "decoder");
-            decoder_name = "avdec_h265";
-        }
+        if (dbsink) {
+            if (gst_pad_is_linked(dbsink)) {
+                // Already linked - schedule safe source switch via pad probe
+                SwitchContext *ctx = g_new0(SwitchContext, 1);
+                ctx->new_pad = gst_object_ref(pad);
 
-        if (decoder) {
-            g_print("[FrameBuffer] Using explicit decoder: %s\n", decoder_name);
+                g_print("[FrameBuffer] Scheduling safe source switch\n");
 
-            // Configure decoder for performance
-            configure_decoder(decoder, decoder_name);
-
-            // Add decoder to pipeline
-            gst_bin_add(GST_BIN(pipeline), decoder);
-            gst_element_sync_state_with_parent(decoder);
-
-            // Link: tsdemux pad -> decoder -> videoconvert
-            GstPad *decoder_sink = gst_element_get_static_pad(decoder, "sink");
-            GstPad *decoder_src = gst_element_get_static_pad(decoder, "src");
-            GstPad *vc_sink = gst_element_get_static_pad(videoconvert, "sink");
-
-            if (decoder_sink && decoder_src && vc_sink) {
-                GstPadLinkReturn ret1 = gst_pad_link(pad, decoder_sink);
-                GstPadLinkReturn ret2 = gst_pad_link(decoder_src, vc_sink);
-
-                if (ret1 == GST_PAD_LINK_OK && ret2 == GST_PAD_LINK_OK) {
-                    g_print("[FrameBuffer] Linked: tsdemux -> %s -> videoconvert\n", decoder_name);
+                // Use IDLE probe - fires when pad is idle, doesn't require data flow
+                // This handles the case where old source stops before probe fires
+                gst_pad_add_probe(
+                    dbsink,
+                    GST_PAD_PROBE_TYPE_IDLE,
+                    on_switch_blocked,
+                    ctx,
+                    NULL
+                );
+                handled = TRUE;
+            } else {
+                // First-time link (no need to block)
+                GstPadLinkReturn ret = gst_pad_link(pad, dbsink);
+                if (ret == GST_PAD_LINK_OK) {
+                    g_print("[FrameBuffer] Linked initial video pad\n");
                     handled = TRUE;
                 } else {
-                    g_printerr("[FrameBuffer] Link failed: ret1=%d ret2=%d\n", ret1, ret2);
+                    g_printerr("[FrameBuffer] Failed to link initial video pad: %d\n", ret);
                 }
             }
 
-            if (decoder_sink) gst_object_unref(decoder_sink);
-            if (decoder_src) gst_object_unref(decoder_src);
-            if (vc_sink) gst_object_unref(vc_sink);
-        } else {
-            g_printerr("[FrameBuffer] No decoder for codec: %s\n", name);
+            gst_object_unref(dbsink);
         }
     }
 
     // Non-video pads (and failed links) go to fakesink
-    if (!handled && !is_video_caps(name)) {
+    if (!handled) {
         link_pad_to_fakesink(demux, pad);
     }
 
     gst_caps_unref(caps);
-    if (pipeline) gst_object_unref(pipeline);
 }
 
 /**
@@ -282,80 +273,52 @@ static FrameBuffer *framebuffer_new(void) {
     fb->bitrate = 2000;
     fb->raw_output = FALSE;
     fb->vp8_output = FALSE;
-    fb->shm_output = FALSE;
-    fb->shm_path = g_strdup("/tmp/framebuffer.sock");
 
     return fb;
 }
 
 /**
  * Create input pipeline: UDP/MPEG-TS -> decode -> appsink
- * Built programmatically with explicit decoder selection (no decodebin3)
- * Decoder is created dynamically in on_demux_pad_added based on detected codec
+ * Built programmatically with manual pad-added handling for tsdemux
+ * Now codec-agnostic using decodebin for automatic decoder selection
  */
 static gboolean create_input_pipeline(FrameBuffer *fb) {
-    fb->input_pipeline = gst_pipeline_new("input-pipeline");
+    GError *error = NULL;
 
-    // Create elements - decoder will be added dynamically based on codec
-    GstElement *udpsrc = gst_element_factory_make("udpsrc", "udpsrc");
-    GstElement *tsdemux = gst_element_factory_make("tsdemux", "tsdemux");
-    GstElement *videoconvert = gst_element_factory_make("videoconvert", "videoconvert");
-    GstElement *videoscale = gst_element_factory_make("videoscale", "videoscale");
-    GstElement *capsfilter = gst_element_factory_make("capsfilter", "capsfilter");
-    fb->appsink = gst_element_factory_make("appsink", "sink");
+    // Build pipeline with gst_parse_launch for simplicity
+    // Key fix: min-threshold-time=1000000000 (1 second buffer before playing)
+    // This smooths out UDP jitter that was causing choppy video
+    gchar *pipeline_str = g_strdup_printf(
+        "udpsrc port=%d buffer-size=67108864 caps=\"video/mpegts,systemstream=true\" name=udpsrc "
+        "! queue min-threshold-time=1000000000 max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 "
+        "! tsparse "
+        "! tsdemux name=demux "
+        "! mpegvideoparse "
+        "! mpeg2dec "
+        "! videoconvert "
+        "! videoscale "
+        "! video/x-raw,format=I420,width=%d,height=%d "
+        "! appsink name=sink emit-signals=true sync=false max-buffers=2 drop=true",
+        fb->input_port, fb->width, fb->height
+    );
 
-    if (!udpsrc || !tsdemux ||
-        !videoconvert || !videoscale || !capsfilter || !fb->appsink) {
-        g_printerr("[FrameBuffer] Failed to create input elements\n");
+    g_print("[FrameBuffer] Creating input pipeline: %s\n", pipeline_str);
+
+    fb->input_pipeline = gst_parse_launch(pipeline_str, &error);
+    g_free(pipeline_str);
+
+    if (error) {
+        g_printerr("[FrameBuffer] Failed to create input pipeline: %s\n", error->message);
+        g_error_free(error);
         return FALSE;
     }
 
-    // Configure udpsrc with MPEG-TS caps
-    GstCaps *src_caps = gst_caps_from_string(
-        "video/mpegts,systemstream=(boolean)true,packetsize=(int)188");
-    g_object_set(udpsrc,
-        "port", fb->input_port,
-        "buffer-size", 2097152,
-        "caps", src_caps,
-        NULL);
-    gst_caps_unref(src_caps);
-
-    // Configure capsfilter
-    gchar *caps_str = g_strdup_printf(
-        "video/x-raw,format=I420,width=%d,height=%d",
-        fb->width, fb->height);
-    GstCaps *caps = gst_caps_from_string(caps_str);
-    g_object_set(capsfilter, "caps", caps, NULL);
-    gst_caps_unref(caps);
-    g_free(caps_str);
-
-    // Configure appsink
-    g_object_set(fb->appsink,
-        "emit-signals", TRUE,
-        "sync", FALSE,
-        "max-buffers", 2,
-        "drop", TRUE,
-        NULL);
-
-    // Add elements to pipeline (decoder added dynamically later)
-    gst_bin_add_many(GST_BIN(fb->input_pipeline),
-        udpsrc, tsdemux,
-        videoconvert, videoscale, capsfilter, fb->appsink, NULL);
-
-    // Link static elements: udpsrc -> tsdemux
-    if (!gst_element_link(udpsrc, tsdemux)) {
-        g_printerr("[FrameBuffer] Failed to link udpsrc to tsdemux\n");
+    // Get appsink
+    fb->appsink = gst_bin_get_by_name(GST_BIN(fb->input_pipeline), "sink");
+    if (!fb->appsink) {
+        g_printerr("[FrameBuffer] Failed to get appsink\n");
         return FALSE;
     }
-
-    // Link post-decode chain: videoconvert -> videoscale -> capsfilter -> appsink
-    if (!gst_element_link_many(videoconvert, videoscale, capsfilter, fb->appsink, NULL)) {
-        g_printerr("[FrameBuffer] Failed to link post-decode chain\n");
-        return FALSE;
-    }
-
-    // Connect to tsdemux's pad-added signal - will create decoder and link to videoconvert
-    g_signal_connect(tsdemux, "pad-added", G_CALLBACK(on_demux_pad_added), videoconvert);
 
     // Connect appsink signal
     g_signal_connect(fb->appsink, "new-sample", G_CALLBACK(on_new_sample), fb);
@@ -366,17 +329,16 @@ static gboolean create_input_pipeline(FrameBuffer *fb) {
     g_signal_connect(bus, "message::error", G_CALLBACK(on_bus_error), (gpointer)"INPUT");
     gst_object_unref(bus);
 
-    g_print("[FrameBuffer] Input pipeline created (port %d)\n", fb->input_port);
+    g_print("[FrameBuffer] Input pipeline created (port %d, 1s buffer)\n", fb->input_port);
     return TRUE;
 }
 
 /**
- * Create output pipeline: appsrc -> encode/passthrough -> output
- * Supports four modes:
+ * Create output pipeline: appsrc -> encode -> UDP
+ * Supports three modes:
  * - H.264 MPEG-TS (default): appsrc -> x264enc -> mpegtsmux -> udpsink
  * - Raw RTP (-r flag):       appsrc -> rtpvrawpay -> udpsink
  * - VP8 RTP (-v flag):       appsrc -> vp8enc -> rtpvp8pay -> udpsink
- * - SHM (-s flag):           appsrc -> shmsink (raw I420 for webrtc-gateway)
  */
 static gboolean create_output_pipeline(FrameBuffer *fb) {
     gchar *caps_str = g_strdup_printf(
@@ -387,26 +349,16 @@ static gboolean create_output_pipeline(FrameBuffer *fb) {
     gchar *pipeline_str;
     const gchar *mode_name;
 
-    if (fb->shm_output) {
-        // Shared memory output - raw I420 for webrtc-gateway
-        // Zero-copy handoff to separate WebRTC process
-        pipeline_str = g_strdup_printf(
-            "appsrc name=src is-live=true format=time do-timestamp=true "
-            "caps=\"%s\" "
-            "! shmsink socket-path=%s sync=false wait-for-connection=false shm-size=10000000",
-            caps_str, fb->shm_path
-        );
-        mode_name = "SHM (raw I420)";
-    } else if (fb->vp8_output) {
+    if (fb->vp8_output) {
         // VP8 RTP output - WebRTC-ready, single encode
         pipeline_str = g_strdup_printf(
             "appsrc name=src is-live=true format=time do-timestamp=true "
             "caps=\"%s\" "
             "! videoconvert "
-            "! vp8enc deadline=1 cpu-used=4 target-bitrate=%d000 keyframe-max-dist=5 "
+            "! vp8enc deadline=1 cpu-used=4 target-bitrate=%d000 keyframe-max-dist=%d "
             "! rtpvp8pay mtu=1200 "
             "! udpsink host=%s port=%d sync=false",
-            caps_str, fb->bitrate, fb->output_host, fb->output_port
+            caps_str, fb->bitrate, fb->fps, fb->output_host, fb->output_port
         );
         mode_name = "VP8 RTP";
     } else if (fb->raw_output) {
@@ -449,13 +401,8 @@ static gboolean create_output_pipeline(FrameBuffer *fb) {
     // Get appsrc
     fb->appsrc = gst_bin_get_by_name(GST_BIN(fb->output_pipeline), "src");
 
-    if (fb->shm_output) {
-        g_print("[FrameBuffer] Output pipeline created (%s @ %dfps, %s)\n",
-                fb->shm_path, fb->fps, mode_name);
-    } else {
-        g_print("[FrameBuffer] Output pipeline created (%s:%d @ %dfps, %s)\n",
-                fb->output_host, fb->output_port, fb->fps, mode_name);
-    }
+    g_print("[FrameBuffer] Output pipeline created (%s:%d @ %dfps, %s)\n",
+            fb->output_host, fb->output_port, fb->fps, mode_name);
     return TRUE;
 }
 
@@ -677,7 +624,6 @@ static void framebuffer_free(FrameBuffer *fb) {
     if (fb->input_pipeline) gst_object_unref(fb->input_pipeline);
     if (fb->output_pipeline) gst_object_unref(fb->output_pipeline);
     g_free(fb->output_host);
-    g_free(fb->shm_path);
     g_mutex_clear(&fb->frame_mutex);
     g_free(fb);
 }
@@ -709,7 +655,6 @@ static void print_usage(const char *prog) {
     g_print("  -b KBPS   Output bitrate in kbps (default: 2000)\n");
     g_print("  -r        Raw RTP output (no encoding)\n");
     g_print("  -v        VP8 RTP output (WebRTC-ready)\n");
-    g_print("  -s [PATH] SHM output for webrtc-gateway (default: /tmp/framebuffer.sock)\n");
 }
 
 /**
@@ -742,13 +687,6 @@ int main(int argc, char *argv[]) {
             fb->raw_output = TRUE;
         } else if (strcmp(argv[i], "-v") == 0) {
             fb->vp8_output = TRUE;
-        } else if (strcmp(argv[i], "-s") == 0) {
-            fb->shm_output = TRUE;
-            // Optional path argument
-            if (i + 1 < argc && argv[i + 1][0] != '-') {
-                g_free(fb->shm_path);
-                fb->shm_path = g_strdup(argv[++i]);
-            }
         } else if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
