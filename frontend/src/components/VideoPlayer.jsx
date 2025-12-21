@@ -15,7 +15,10 @@ export function VideoPlayer({ src, webrtcStream }) {
   // Handle WebRTC stream
   useEffect(() => {
     if (videoRef.current && webrtcStream) {
-      console.log('Setting WebRTC stream on video element');
+      console.log('=== VideoPlayer: Setting new WebRTC stream ===');
+      console.log('Stream ID:', webrtcStream.id);
+      console.log('Track count:', webrtcStream.getTracks().length);
+      webrtcStream.getTracks().forEach(t => console.log('Track:', t.kind, t.id, t.readyState));
       videoRef.current.srcObject = webrtcStream;
       videoRef.current.play().catch((err) => {
         console.error('Video play error:', err);

@@ -1,7 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import * as mediasoupClient from 'mediasoup-client';
 
 const WS_URL = 'ws://localhost:3001';
+
+// STUN servers for ICE
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' }
+];
 
 export function useWebSocket() {
   const [isConnected, setIsConnected] = useState(false);
@@ -13,10 +18,8 @@ export function useWebSocket() {
 
   const wsRef = useRef(null);
   const reconnectTimeoutRef = useRef(null);
-  const deviceRef = useRef(null);
-  const transportRef = useRef(null);
-  const consumerRef = useRef(null);
-  const pendingResolvers = useRef({});
+  const pcRef = useRef(null);  // RTCPeerConnection
+  const webrtcInitialized = useRef(false);
 
   const send = useCallback((data) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -24,109 +27,120 @@ export function useWebSocket() {
     }
   }, []);
 
-  // Wait for a specific message type
-  const waitForMessage = useCallback((type) => {
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        delete pendingResolvers.current[type];
-        reject(new Error(`Timeout waiting for ${type}`));
-      }, 10000);
+  // Initialize WebRTC with native RTCPeerConnection
+  const initWebRTC = useCallback(() => {
+    if (webrtcInitialized.current) {
+      console.log('WebRTC already initialized');
+      return;
+    }
 
-      pendingResolvers.current[type] = (data) => {
-        clearTimeout(timeout);
-        resolve(data);
-      };
-    });
-  }, []);
+    console.log('Requesting WebRTC initialization...');
+    webrtcInitialized.current = true;
 
-  // Initialize mediasoup device
-  const initWebRTC = useCallback(async (rtpCapabilities) => {
-    console.log('Initializing WebRTC device...');
+    // Request server to add us as a client
+    send({ type: 'webrtc-init' });
+  }, [send]);
+
+  // Handle SDP offer from server (via GStreamer webrtcbin)
+  const handleOffer = useCallback(async (sdp) => {
+    console.log('Received SDP offer from server');
+
+    // Close existing connection if any (for hot-swap reconnection)
+    if (pcRef.current) {
+      console.log('Closing existing peer connection for new offer');
+      pcRef.current.close();
+      pcRef.current = null;
+    }
 
     try {
-      // Create device
-      const device = new mediasoupClient.Device();
-      await device.load({ routerRtpCapabilities: rtpCapabilities });
-      deviceRef.current = device;
-      console.log('Device loaded');
+      // Create peer connection
+      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      pcRef.current = pc;
 
-      // Request transport creation
-      send({ type: 'webrtc-create-transport' });
-      const { transportParams } = await waitForMessage('webrtc-transport-created');
-      console.log('Transport params received:', transportParams.id);
+      // Handle incoming tracks
+      pc.ontrack = (event) => {
+        console.log('Received track:', event.track.kind);
+        const stream = new MediaStream([event.track]);
+        setWebrtcStream(stream);
+      };
 
-      // Create receive transport
-      const transport = device.createRecvTransport(transportParams);
-      transportRef.current = transport;
-
-      transport.on('connect', async ({ dtlsParameters }, callback, errback) => {
-        try {
-          send({ type: 'webrtc-connect-transport', dtlsParameters });
-          await waitForMessage('webrtc-transport-connected');
-          callback();
-        } catch (error) {
-          errback(error);
+      // Handle ICE candidates from our side
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          console.log('Sending ICE candidate to server');
+          send({
+            type: 'webrtc-ice-candidate',
+            candidate: event.candidate.candidate,
+            sdpMLineIndex: event.candidate.sdpMLineIndex
+          });
         }
-      });
+      };
 
-      transport.on('connectionstatechange', (state) => {
-        console.log('Transport connection state:', state);
-        if (state === 'failed' || state === 'closed') {
+      // Handle connection state changes
+      pc.onconnectionstatechange = () => {
+        console.log('Connection state:', pc.connectionState);
+        if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
           cleanupWebRTC();
         }
-      });
+      };
 
-      // Request consumer creation
+      pc.oniceconnectionstatechange = () => {
+        console.log('ICE connection state:', pc.iceConnectionState);
+      };
+
+      // Set remote description (the offer from GStreamer)
+      await pc.setRemoteDescription(new RTCSessionDescription({
+        type: 'offer',
+        sdp: sdp
+      }));
+      console.log('Remote description set');
+
+      // Create and set local description (our answer)
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      console.log('Local description set');
+
+      // Send answer to server
       send({
-        type: 'webrtc-consume',
-        rtpCapabilities: device.rtpCapabilities
+        type: 'webrtc-answer',
+        sdp: answer.sdp
       });
-      const { consumerParams } = await waitForMessage('webrtc-consumer-created');
-      console.log('Consumer params received:', consumerParams.id);
-
-      // Create consumer
-      const consumer = await transport.consume({
-        id: consumerParams.id,
-        producerId: consumerParams.producerId,
-        kind: consumerParams.kind,
-        rtpParameters: consumerParams.rtpParameters
-      });
-      consumerRef.current = consumer;
-
-      // Create MediaStream from consumer track
-      const stream = new MediaStream([consumer.track]);
-      setWebrtcStream(stream);
-      console.log('WebRTC stream created');
-
-      // Resume consumer
-      send({ type: 'webrtc-resume' });
+      console.log('Sent SDP answer to server');
 
     } catch (error) {
-      console.error('WebRTC initialization failed:', error);
+      console.error('Failed to handle offer:', error);
+      cleanupWebRTC();
     }
-  }, [send, waitForMessage]);
+  }, [send]);
+
+  // Handle ICE candidate from server
+  const handleIceCandidate = useCallback(async (candidate, sdpMLineIndex) => {
+    if (!pcRef.current) {
+      console.warn('No peer connection for ICE candidate');
+      return;
+    }
+
+    try {
+      await pcRef.current.addIceCandidate(new RTCIceCandidate({
+        candidate: candidate,
+        sdpMLineIndex: sdpMLineIndex
+      }));
+      console.log('Added ICE candidate from server');
+    } catch (error) {
+      console.error('Failed to add ICE candidate:', error);
+    }
+  }, []);
 
   const cleanupWebRTC = useCallback(() => {
-    if (consumerRef.current) {
-      consumerRef.current.close();
-      consumerRef.current = null;
+    if (pcRef.current) {
+      pcRef.current.close();
+      pcRef.current = null;
     }
-    if (transportRef.current) {
-      transportRef.current.close();
-      transportRef.current = null;
-    }
-    deviceRef.current = null;
+    webrtcInitialized.current = false;
     setWebrtcStream(null);
   }, []);
 
   const handleMessage = useCallback((message) => {
-    // Check for pending resolvers first
-    if (pendingResolvers.current[message.type]) {
-      pendingResolvers.current[message.type](message);
-      delete pendingResolvers.current[message.type];
-      return;
-    }
-
     switch (message.type) {
       case 'status':
         setClientId(message.clientId);
@@ -141,8 +155,8 @@ export function useWebSocket() {
           setHlsUrl(null);
         }
         // Initialize WebRTC if UDP stream is active
-        if (message.webrtc && message.rtpCapabilities && !webrtcStream) {
-          initWebRTC(message.rtpCapabilities);
+        if (message.webrtc && !webrtcInitialized.current) {
+          initWebRTC();
         }
         break;
 
@@ -160,9 +174,36 @@ export function useWebSocket() {
           setHlsUrl(`http://localhost:3001${message.hlsUrl}`);
         }
         // Initialize WebRTC if available
-        if (message.webrtc && message.rtpCapabilities) {
-          initWebRTC(message.rtpCapabilities);
+        if (message.webrtc) {
+          initWebRTC();
         }
+        break;
+
+      case 'stream-switched':
+        // Hot-swap: pipeline restarts, need new WebRTC negotiation
+        console.log('Stream switched to:', message.source);
+        setStatus({
+          streaming: true,
+          source: message.source,
+          mode: message.mode
+        });
+        break;
+
+      case 'webrtc-reconnect':
+        // Server requests WebRTC reconnection (after hot-swap)
+        console.log('WebRTC reconnection requested');
+        cleanupWebRTC();
+        // Small delay to let cleanup finish, then wait for new offer
+        break;
+
+      case 'webrtc-offer':
+        // Server (GStreamer) sent us an SDP offer
+        handleOffer(message.sdp);
+        break;
+
+      case 'webrtc-ice-candidate':
+        // Server (GStreamer) sent us an ICE candidate
+        handleIceCandidate(message.candidate, message.sdpMLineIndex);
         break;
 
       case 'stream-stopped':
@@ -181,7 +222,7 @@ export function useWebSocket() {
         console.error('Server error:', message.message);
         break;
     }
-  }, [initWebRTC, cleanupWebRTC]);
+  }, [initWebRTC, handleOffer, handleIceCandidate, cleanupWebRTC]);
 
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;

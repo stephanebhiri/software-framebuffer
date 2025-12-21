@@ -1,7 +1,7 @@
 /**
- * FrameBuffer Service
- * Manages the C framebuffer process for ultra-stable video frame synchronization
- * Provides decoupled input/output with rock-solid timing
+ * FrameSync Service
+ * Manages SoftwareFrameSync process for stream stabilization
+ * Provides A/B switching, TBC, and format normalization
  */
 import { spawn } from 'child_process';
 import { EventEmitter } from 'events';
@@ -11,35 +11,33 @@ import { existsSync } from 'fs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-export class FrameBufferService extends EventEmitter {
+export class FrameSyncService extends EventEmitter {
   constructor() {
     super();
     this.process = null;
     this.isRunning = false;
-    this.stats = {
-      framesIn: 0,
-      framesOut: 0,
-      framesRepeated: 0
-    };
     this.config = {
-      inputPort: 5001,
-      outputPort: 5002,
+      inputPort: 5000,
+      outputPort: 5001,
       outputHost: '127.0.0.1',
+      outputFormat: 'mpegts',  // mpegts for WebRTC pipeline compatibility
       width: 640,
       height: 480,
       fps: 25,
       bitrate: 2000,
-      rawOutput: false  // -r flag: output raw RTP instead of H.264 MPEG-TS
+      watchdogMs: 10000,  // 10 seconds to allow decoder recovery
+      resumeMs: 100
     };
   }
 
   /**
-   * Get path to framebuffer binary
+   * Get path to framesync binary
    */
   getBinaryPath() {
+    // Check in backend/bin first, then in SoftwareFrameSync project
     const paths = [
-      join(__dirname, '../../bin/framebuffer'),
-      join(__dirname, '../framebuffer/framebuffer')
+      join(__dirname, '../../bin/framesync'),
+      '/Users/stephane/Documents/CV_Stephane_Bhiri/SoftwareFrameSync/framesync'
     ];
 
     for (const p of paths) {
@@ -51,18 +49,18 @@ export class FrameBufferService extends EventEmitter {
   }
 
   /**
-   * Start the framebuffer process
+   * Start the framesync process
    * @param {object} options - Configuration options
    */
   async start(options = {}) {
     if (this.isRunning) {
-      console.log('FrameBuffer: Already running');
+      console.log('FrameSync: Already running');
       return;
     }
 
     const binaryPath = this.getBinaryPath();
     if (!binaryPath) {
-      throw new Error('FrameBuffer binary not found. Build it with: cd backend/src/framebuffer && make');
+      throw new Error('FrameSync binary not found. Build it with: cd SoftwareFrameSync && make');
     }
 
     // Merge options
@@ -72,18 +70,16 @@ export class FrameBufferService extends EventEmitter {
       '-i', String(this.config.inputPort),
       '-o', String(this.config.outputPort),
       '-H', this.config.outputHost,
+      '-F', this.config.outputFormat,
       '-w', String(this.config.width),
       '-h', String(this.config.height),
       '-f', String(this.config.fps),
-      '-b', String(this.config.bitrate)
+      '-b', String(this.config.bitrate),
+      '-W', String(this.config.watchdogMs),
+      '-R', String(this.config.resumeMs)
     ];
 
-    // Add raw output flag if enabled
-    if (this.config.rawOutput) {
-      args.push('-r');
-    }
-
-    console.log(`FrameBuffer: Starting ${binaryPath} ${args.join(' ')}`);
+    console.log(`FrameSync: Starting ${binaryPath} ${args.join(' ')}`);
 
     this.process = spawn(binaryPath, args, {
       stdio: ['pipe', 'pipe', 'pipe']
@@ -92,59 +88,51 @@ export class FrameBufferService extends EventEmitter {
     this.process.stdout.on('data', (data) => {
       const lines = data.toString().split('\n').filter(l => l.trim());
       for (const line of lines) {
-        // Parse stats from output
-        const statsMatch = line.match(/Stats: in=(\d+) out=(\d+) repeated=(\d+)/);
-        if (statsMatch) {
-          this.stats.framesIn = parseInt(statsMatch[1]);
-          this.stats.framesOut = parseInt(statsMatch[2]);
-          this.stats.framesRepeated = parseInt(statsMatch[3]);
-          this.emit('stats', this.stats);
-        }
+        console.log('[FrameSync]', line);
 
-        // Log important messages
-        if (line.includes('[FrameBuffer]')) {
-          console.log(line);
+        // Detect state changes
+        if (line.includes('SWITCHED TO FALLBACK')) {
+          this.emit('fallback');
+        } else if (line.includes('SWITCHED TO INGEST')) {
+          this.emit('ingest');
         }
       }
     });
 
     this.process.stderr.on('data', (data) => {
-      const msg = data.toString().trim();
-      if (msg) {
-        console.error('[FrameBuffer ERR]', msg);
-      }
+      console.error('[FrameSync ERR]', data.toString().trim());
     });
 
     this.process.on('close', (code) => {
-      console.log(`FrameBuffer: Process exited with code ${code}`);
+      console.log(`FrameSync: Process exited with code ${code}`);
       this.isRunning = false;
       this.process = null;
       this.emit('closed', code);
     });
 
     this.process.on('error', (err) => {
-      console.error('FrameBuffer: Process error:', err.message);
+      console.error('FrameSync: Process error:', err.message);
       this.emit('error', err);
     });
 
     this.isRunning = true;
 
-    // Wait for the process to initialize
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    // Wait a bit for the process to initialize
+    await new Promise(resolve => setTimeout(resolve, 500));
 
-    console.log('FrameBuffer: Started');
+    console.log('FrameSync: Started');
     this.emit('started');
   }
 
   /**
-   * Stop the framebuffer process
+   * Stop the framesync process
    */
   async stop() {
     if (!this.process) {
       return;
     }
 
-    console.log('FrameBuffer: Stopping');
+    console.log('FrameSync: Stopping');
 
     this.process.kill('SIGTERM');
 
@@ -157,8 +145,7 @@ export class FrameBufferService extends EventEmitter {
 
     this.process = null;
     this.isRunning = false;
-    this.stats = { framesIn: 0, framesOut: 0, framesRepeated: 0 };
-    console.log('FrameBuffer: Stopped');
+    console.log('FrameSync: Stopped');
   }
 
   /**
@@ -167,8 +154,7 @@ export class FrameBufferService extends EventEmitter {
   getStatus() {
     return {
       running: this.isRunning,
-      config: this.config,
-      stats: this.stats
+      config: this.config
     };
   }
 
@@ -178,20 +164,6 @@ export class FrameBufferService extends EventEmitter {
   getOutputPort() {
     return this.config.outputPort;
   }
-
-  /**
-   * Get the input port (for upstream to send to)
-   */
-  getInputPort() {
-    return this.config.inputPort;
-  }
-
-  /**
-   * Check if raw output mode is enabled
-   */
-  isRawOutput() {
-    return this.config.rawOutput;
-  }
 }
 
-export default FrameBufferService;
+export default FrameSyncService;

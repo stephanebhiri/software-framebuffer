@@ -1,0 +1,9 @@
+{
+  "name": "stanag-simulator",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "start:video": "node index.js --video"
+  }
+}
