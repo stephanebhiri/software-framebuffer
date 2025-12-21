@@ -29,7 +29,8 @@ export class FrameBufferService extends EventEmitter {
       height: 480,
       fps: 25,
       bitrate: 2000,
-      rawOutput: false  // -r flag: output raw RTP instead of H.264 MPEG-TS
+      rawOutput: false,  // -r flag: output raw RTP instead of H.264 MPEG-TS
+      vp8Output: false   // -v flag: output VP8 RTP (WebRTC-ready)
     };
   }
 
@@ -78,8 +79,10 @@ export class FrameBufferService extends EventEmitter {
       '-b', String(this.config.bitrate)
     ];
 
-    // Add raw output flag if enabled
-    if (this.config.rawOutput) {
+    // Add output mode flag
+    if (this.config.vp8Output) {
+      args.push('-v');  // VP8 takes priority
+    } else if (this.config.rawOutput) {
       args.push('-r');
     }
 
@@ -191,6 +194,22 @@ export class FrameBufferService extends EventEmitter {
    */
   isRawOutput() {
     return this.config.rawOutput;
+  }
+
+  /**
+   * Check if VP8 output mode is enabled
+   */
+  isVp8Output() {
+    return this.config.vp8Output;
+  }
+
+  /**
+   * Get the output mode name
+   */
+  getOutputMode() {
+    if (this.config.vp8Output) return 'vp8';
+    if (this.config.rawOutput) return 'raw';
+    return 'h264';
   }
 }
 

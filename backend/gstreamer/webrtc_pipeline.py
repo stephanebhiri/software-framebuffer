@@ -295,6 +295,7 @@ class WebRTCPipeline:
         port = config.get('port', 5000)
         codec = config.get('codec', 'h264')
         raw_input = config.get('raw', False)  # Raw RTP input from FrameBuffer -r
+        vp8_input = config.get('vp8', False)  # VP8 RTP input from FrameBuffer -v
         self.current_codec = codec
 
         self.pipeline = Gst.Pipeline.new("webrtc-pipeline")
@@ -339,7 +340,33 @@ class WebRTCPipeline:
         vlc_udpsink.set_property("host", "127.0.0.1")
         vlc_udpsink.set_property("port", 5004)
 
-        if raw_input:
+        if vp8_input:
+            # ===== VP8 RTP MODE =====
+            # Direct VP8 RTP from FrameBuffer -v flag - zero encode in Python!
+            # Pipeline: udpsrc -> rtpvp8depay -> rtpvp8pay -> webrtcbin
+            self._log("Using VP8 RTP input mode (passthrough, no encode needed)")
+
+            # Set caps for VP8 RTP
+            rtp_caps = Gst.Caps.from_string(
+                "application/x-rtp,media=video,encoding-name=VP8,clock-rate=90000,payload=96"
+            )
+            udpsrc.set_property("caps", rtp_caps)
+
+            rtpvp8depay = Gst.ElementFactory.make("rtpvp8depay", "rtpvp8depay")
+
+            # Add elements - note: we skip encoder since VP8 is already encoded
+            for elem in [udpsrc, queue1, rtpvp8depay,
+                         self.rtppay, self.tee,
+                         vlc_queue, vlc_udpsink]:
+                self.pipeline.add(elem)
+
+            # Link: udpsrc -> queue -> rtpvp8depay -> rtpvp8pay -> tee
+            udpsrc.link(queue1)
+            queue1.link(rtpvp8depay)
+            rtpvp8depay.link(self.rtppay)
+            self.rtppay.link(self.tee)
+
+        elif raw_input:
             # ===== RAW RTP MODE =====
             # Direct raw video from FrameBuffer -r flag
             # Pipeline: udpsrc -> rtpvrawdepay -> videoconvert -> vp8enc -> webrtcbin

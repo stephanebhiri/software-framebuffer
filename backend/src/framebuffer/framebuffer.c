@@ -49,6 +49,7 @@ typedef struct {
     gint fps;
     gint bitrate;
     gboolean raw_output;  // Output raw video instead of H.264 MPEG-TS
+    gboolean vp8_output;  // Output VP8 RTP (for direct WebRTC)
 
     GMainLoop *loop;
 } FrameBuffer;
@@ -271,6 +272,7 @@ static FrameBuffer *framebuffer_new(void) {
     fb->fps = 25;
     fb->bitrate = 2000;
     fb->raw_output = FALSE;
+    fb->vp8_output = FALSE;
 
     return fb;
 }
@@ -363,9 +365,10 @@ static gboolean create_input_pipeline(FrameBuffer *fb) {
 
 /**
  * Create output pipeline: appsrc -> encode -> UDP
- * Supports two modes:
+ * Supports three modes:
  * - H.264 MPEG-TS (default): appsrc -> x264enc -> mpegtsmux -> udpsink
  * - Raw RTP (-r flag):       appsrc -> rtpvrawpay -> udpsink
+ * - VP8 RTP (-v flag):       appsrc -> vp8enc -> rtpvp8pay -> udpsink
  */
 static gboolean create_output_pipeline(FrameBuffer *fb) {
     gchar *caps_str = g_strdup_printf(
@@ -374,8 +377,21 @@ static gboolean create_output_pipeline(FrameBuffer *fb) {
     );
 
     gchar *pipeline_str;
+    const gchar *mode_name;
 
-    if (fb->raw_output) {
+    if (fb->vp8_output) {
+        // VP8 RTP output - WebRTC-ready, single encode
+        pipeline_str = g_strdup_printf(
+            "appsrc name=src is-live=true format=time do-timestamp=true "
+            "caps=\"%s\" "
+            "! videoconvert "
+            "! vp8enc deadline=1 cpu-used=4 target-bitrate=%d000 keyframe-max-dist=%d "
+            "! rtpvp8pay mtu=1200 "
+            "! udpsink host=%s port=%d sync=false",
+            caps_str, fb->bitrate, fb->fps, fb->output_host, fb->output_port
+        );
+        mode_name = "VP8 RTP";
+    } else if (fb->raw_output) {
         // Raw RTP output - no encoding, minimal latency
         pipeline_str = g_strdup_printf(
             "appsrc name=src is-live=true format=time do-timestamp=true "
@@ -384,6 +400,7 @@ static gboolean create_output_pipeline(FrameBuffer *fb) {
             "! udpsink host=%s port=%d sync=false",
             caps_str, fb->output_host, fb->output_port
         );
+        mode_name = "RAW RTP";
     } else {
         // H.264 MPEG-TS output (default)
         pipeline_str = g_strdup_printf(
@@ -396,6 +413,7 @@ static gboolean create_output_pipeline(FrameBuffer *fb) {
             "! udpsink host=%s port=%d sync=false",
             caps_str, fb->bitrate, fb->fps, fb->output_host, fb->output_port
         );
+        mode_name = "H.264 MPEG-TS";
     }
 
     g_free(caps_str);
@@ -414,8 +432,7 @@ static gboolean create_output_pipeline(FrameBuffer *fb) {
     fb->appsrc = gst_bin_get_by_name(GST_BIN(fb->output_pipeline), "src");
 
     g_print("[FrameBuffer] Output pipeline created (%s:%d @ %dfps, %s)\n",
-            fb->output_host, fb->output_port, fb->fps,
-            fb->raw_output ? "RAW RTP" : "H.264 MPEG-TS");
+            fb->output_host, fb->output_port, fb->fps, mode_name);
     return TRUE;
 }
 
@@ -666,7 +683,8 @@ static void print_usage(const char *prog) {
     g_print("  -h HEIGHT Output height (default: 480)\n");
     g_print("  -f FPS    Output framerate (default: 25)\n");
     g_print("  -b KBPS   Output bitrate in kbps (default: 2000)\n");
-    g_print("  -r        Raw RTP output (no H.264 encoding)\n");
+    g_print("  -r        Raw RTP output (no encoding)\n");
+    g_print("  -v        VP8 RTP output (WebRTC-ready)\n");
 }
 
 /**
@@ -697,6 +715,8 @@ int main(int argc, char *argv[]) {
             fb->bitrate = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-r") == 0) {
             fb->raw_output = TRUE;
+        } else if (strcmp(argv[i], "-v") == 0) {
+            fb->vp8_output = TRUE;
         } else if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;

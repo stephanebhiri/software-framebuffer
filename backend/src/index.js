@@ -365,7 +365,8 @@ async function startUDPStream(port = 5000) {
     }
 
     // Start FrameBuffer if enabled (ultra-stable frame synchronization)
-    let useRawOutput = true;  // Use raw RTP output (no H.264 encode/decode cycle)
+    // Output modes: 'vp8' (WebRTC-ready), 'raw' (no encode), 'h264' (MPEG-TS)
+    let outputMode = 'vp8';  // Use VP8 output - single encode, WebRTC-ready
 
     if (useFrameBuffer) {
       try {
@@ -378,9 +379,10 @@ async function startUDPStream(port = 5000) {
           height: 480,
           fps: 25,
           bitrate: 2000,
-          rawOutput: useRawOutput
+          vp8Output: outputMode === 'vp8',
+          rawOutput: outputMode === 'raw'
         });
-        console.log(`FrameBuffer started (${useRawOutput ? 'RAW RTP' : 'H.264 MPEG-TS'})`);
+        console.log(`FrameBuffer started (${outputMode.toUpperCase()} mode)`);
         webrtcPort = framebufferOutputPort;
         console.log(`FrameBuffer: Input ${splitterOutputPort} -> Output ${webrtcPort}`);
 
@@ -392,11 +394,11 @@ async function startUDPStream(port = 5000) {
         console.warn('FrameBuffer not available, using direct input:', error.message);
         frameBufferService = null;
         webrtcPort = splitterOutputPort;
-        useRawOutput = false;
+        outputMode = 'h264';  // Fallback to H.264 MPEG-TS
       }
     } else {
       webrtcPort = splitterOutputPort;
-      useRawOutput = false;
+      outputMode = 'h264';
     }
 
     // Reinitialize service if needed
@@ -409,11 +411,12 @@ async function startUDPStream(port = 5000) {
       await webrtcService.start('udp', {
         port: webrtcPort,
         codec: simulatorCodec,
-        raw: useRawOutput,  // Tell WebRTC to use raw RTP input
-        width: 640,         // Must match FrameBuffer output
+        vp8: outputMode === 'vp8',   // VP8 RTP passthrough (no encode)
+        raw: outputMode === 'raw',   // Raw RTP input (encode to VP8)
+        width: 640,                  // Must match FrameBuffer output
         height: 480
       });
-      console.log(`WebRTC pipeline started on port ${webrtcPort} (${useRawOutput ? 'RAW' : 'H.264'})`);
+      console.log(`WebRTC pipeline started on port ${webrtcPort} (${outputMode.toUpperCase()} mode)`);
     } catch (error) {
       console.error('Failed to start WebRTC:', error);
       broadcast({ type: 'error', message: error.message });
