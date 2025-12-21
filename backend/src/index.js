@@ -409,7 +409,9 @@ async function startUDPStream(port = 5000) {
       await webrtcService.start('udp', {
         port: webrtcPort,
         codec: simulatorCodec,
-        raw: useRawOutput  // Tell WebRTC to use raw RTP input
+        raw: useRawOutput,  // Tell WebRTC to use raw RTP input
+        width: 640,         // Must match FrameBuffer output
+        height: 480
       });
       console.log(`WebRTC pipeline started on port ${webrtcPort} (${useRawOutput ? 'RAW' : 'H.264'})`);
     } catch (error) {

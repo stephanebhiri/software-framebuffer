@@ -345,9 +345,13 @@ class WebRTCPipeline:
             # Pipeline: udpsrc -> rtpvrawdepay -> videoconvert -> vp8enc -> webrtcbin
             self._log("Using RAW RTP input mode (no decode needed)")
 
-            # Set caps for raw RTP
+            # Set caps for raw RTP - must match FrameBuffer output format (I420 640x480)
+            # FrameBuffer sends video/x-raw,format=I420 which becomes YCbCr-4:2:0 in RTP
+            width = config.get('width', 640)
+            height = config.get('height', 480)
             rtp_caps = Gst.Caps.from_string(
-                "application/x-rtp,media=video,encoding-name=RAW,clock-rate=90000"
+                f"application/x-rtp,media=video,encoding-name=RAW,clock-rate=90000,"
+                f"sampling=YCbCr-4:2:0,depth=(string)8,width=(string){width},height=(string){height}"
             )
             udpsrc.set_property("caps", rtp_caps)
 
