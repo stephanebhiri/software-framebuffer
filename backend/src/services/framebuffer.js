@@ -30,7 +30,9 @@ export class FrameBufferService extends EventEmitter {
       fps: 25,
       bitrate: 2000,
       rawOutput: false,  // -r flag: output raw RTP instead of H.264 MPEG-TS
-      vp8Output: false   // -v flag: output VP8 RTP (WebRTC-ready)
+      vp8Output: false,  // -v flag: output VP8 RTP (WebRTC-ready)
+      shmOutput: false,  // -s flag: output raw I420 via shared memory
+      shmPath: '/tmp/framebuffer.sock'  // shared memory socket path
     };
   }
 
@@ -79,8 +81,10 @@ export class FrameBufferService extends EventEmitter {
       '-b', String(this.config.bitrate)
     ];
 
-    // Add output mode flag
-    if (this.config.vp8Output) {
+    // Add output mode flag (priority: shm > vp8 > raw)
+    if (this.config.shmOutput) {
+      args.push('-s', this.config.shmPath);  // SHM output for webrtc-gateway
+    } else if (this.config.vp8Output) {
       args.push('-v');  // VP8 takes priority
     } else if (this.config.rawOutput) {
       args.push('-r');
@@ -88,8 +92,18 @@ export class FrameBufferService extends EventEmitter {
 
     console.log(`FrameBuffer: Starting ${binaryPath} ${args.join(' ')}`);
 
+    // Disable macOS hardware decoders (vtdec) which fail on some 4K MPEG2 content
+    // Force software decoding with multi-threading for better performance
+    const env = {
+      ...process.env,
+      GST_PLUGIN_FEATURE_RANK: 'vtdec:0,vtdec_hw:0,vtdechw:0',
+      // Enable multi-threading for FFmpeg decoders (0 = auto, uses all cores)
+      LIBAV_THREADS: '0'
+    };
+
     this.process = spawn(binaryPath, args, {
-      stdio: ['pipe', 'pipe', 'pipe']
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env
     });
 
     this.process.stdout.on('data', (data) => {
@@ -207,9 +221,24 @@ export class FrameBufferService extends EventEmitter {
    * Get the output mode name
    */
   getOutputMode() {
+    if (this.config.shmOutput) return 'shm';
     if (this.config.vp8Output) return 'vp8';
     if (this.config.rawOutput) return 'raw';
     return 'h264';
+  }
+
+  /**
+   * Check if SHM output mode is enabled
+   */
+  isShmOutput() {
+    return this.config.shmOutput;
+  }
+
+  /**
+   * Get the SHM socket path
+   */
+  getShmPath() {
+    return this.config.shmPath;
   }
 }
 

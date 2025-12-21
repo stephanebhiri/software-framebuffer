@@ -18,6 +18,8 @@ import FFmpegService from './services/ffmpeg.js';
 import GStreamerWebRTCService from './services/gstreamer-webrtc.js';
 import FrameBufferService from './services/framebuffer.js';
 import UDPKLVSplitter from './services/udp-klv-splitter.js';
+import WebRTCGatewayService from './services/webrtc-gateway.js';
+import UDPDuplicator from './services/udp-duplicator.js';
 import orchestrator from './services/orchestrator.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -42,9 +44,13 @@ let ffmpegService = null;
 let webrtcService = null;
 let frameBufferService = null;
 let klvSplitter = null;
+let webrtcGateway = null;  // New C-based WebRTC gateway
+let udpDuplicator = null;  // UDP duplicator for monitoring
 let currentSource = null;
 let streamMode = null; // 'file' or 'udp'
 let useFrameBuffer = true; // Enable FrameBuffer for stable output timing
+let useShmArchitecture = true; // Use new SHM + webrtc-gateway architecture
+const MONITOR_PORT = 5004; // Port for ffplay monitoring
 
 // ===== WebRTC Service Setup =====
 function setupWebRTCService() {
@@ -134,6 +140,71 @@ function setupWebRTCService() {
 // Initialize service
 webrtcService = setupWebRTCService();
 
+// ===== WebRTC Gateway Setup (new SHM-based architecture) =====
+function setupWebRTCGateway() {
+  const gateway = new WebRTCGatewayService();
+
+  // Forward SDP offer to all clients (gateway creates offer, browser answers)
+  gateway.on('offer', (sdp) => {
+    console.log('WebRTC Gateway: Sending offer to clients');
+    for (const [ws, client] of clients) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'webrtc-offer',
+          sdp
+        }));
+      }
+    }
+  });
+
+  // Forward SDP answer to all clients (if browser sent offer)
+  gateway.on('answer', (sdp) => {
+    console.log('WebRTC Gateway: Sending answer to clients');
+    for (const [ws, client] of clients) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'webrtc-answer',
+          sdp
+        }));
+      }
+    }
+  });
+
+  // Forward ICE candidates to all clients
+  gateway.on('ice-candidate', (candidate) => {
+    for (const [ws, client] of clients) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'webrtc-ice-candidate',
+          candidate: candidate.candidate,
+          sdpMLineIndex: candidate.sdpMLineIndex
+        }));
+      }
+    }
+  });
+
+  gateway.on('client-connected', () => {
+    console.log('WebRTC Gateway: Client connected');
+    broadcast({ type: 'webrtc-connected' });
+  });
+
+  gateway.on('client-disconnected', () => {
+    console.log('WebRTC Gateway: Client disconnected');
+  });
+
+  gateway.on('error', (error) => {
+    console.error('WebRTC Gateway error:', error);
+    broadcast({ type: 'stream-error', message: error.message });
+  });
+
+  gateway.on('closed', (code) => {
+    console.log('WebRTC Gateway closed with code:', code);
+    webrtcGateway = null;
+  });
+
+  return gateway;
+}
+
 // ===== WebSocket Connection Handling =====
 wss.on('connection', (ws) => {
   const clientId = randomUUID();
@@ -178,14 +249,15 @@ wss.on('connection', (ws) => {
   });
 
   // Send current status
+  const webrtcReady = webrtcService?.isReady || webrtcGateway?.isReady;
   ws.send(JSON.stringify({
     type: 'status',
     clientId,
-    streaming: !!(ffmpegService || webrtcService?.isReady),
+    streaming: !!(ffmpegService || webrtcReady),
     source: currentSource,
     mode: streamMode,
     hlsUrl: (streamMode === 'file' && ffmpegService) ? '/hls/playlist.m3u8' : null,
-    webrtc: streamMode === 'udp' && webrtcService?.isReady
+    webrtc: streamMode === 'udp' && webrtcReady
   }));
 });
 
@@ -224,10 +296,14 @@ async function handleClientMessage(ws, data) {
       await stopStream();
       break;
 
-    // WebRTC signaling (new webrtcbin-based)
+    // WebRTC signaling
     case 'webrtc-init':
       // Client wants to join WebRTC
-      if (webrtcService?.isReady) {
+      if (useShmArchitecture && webrtcGateway?.isReady) {
+        // New SHM architecture: start pipeline on webrtc-gateway
+        webrtcGateway.startPipeline();
+      } else if (webrtcService?.isReady) {
+        // Legacy Python-based WebRTC
         webrtcService.addClient(client.id);
       } else {
         ws.send(JSON.stringify({
@@ -237,16 +313,31 @@ async function handleClientMessage(ws, data) {
       }
       break;
 
+    case 'webrtc-offer':
+      // Browser sends SDP offer (for SHM architecture where browser initiates)
+      if (useShmArchitecture && webrtcGateway?.isReady) {
+        webrtcGateway.setOffer(data.sdp);
+      }
+      break;
+
     case 'webrtc-answer':
       // Browser sends SDP answer
-      if (webrtcService?.isReady) {
+      if (useShmArchitecture && webrtcGateway?.isReady) {
+        webrtcGateway.setAnswer(data.sdp);
+      } else if (webrtcService?.isReady) {
         webrtcService.setAnswer(client.id, data.sdp);
       }
       break;
 
     case 'webrtc-ice-candidate':
       // Browser sends ICE candidate
-      if (webrtcService?.isReady && data.candidate) {
+      if (useShmArchitecture && webrtcGateway?.isReady && data.candidate) {
+        webrtcGateway.addIceCandidate(
+          data.candidate,
+          data.sdpMLineIndex || 0,
+          data.sdpMid
+        );
+      } else if (webrtcService?.isReady && data.candidate) {
         webrtcService.addIceCandidate(
           client.id,
           data.candidate,
@@ -302,133 +393,207 @@ async function startFileStream(filePath) {
   });
 }
 
-// ===== UDP STREAM MODE with WebRTC (GStreamer webrtcbin) =====
+// ===== UDP STREAM MODE with WebRTC =====
 async function startUDPStream(port = 5000) {
   console.log('Starting UDP stream on port:', port);
 
-  const isHotSwap = webrtcService?.isReady;
-
-  // Determine the port WebRTC should listen on
-  // If FrameBuffer is enabled, it listens on splitter output and outputs to webrtcPort
-  let webrtcPort = port;
+  // Check for hot-swap
+  const isHotSwap = useShmArchitecture ? webrtcGateway?.isReady : webrtcService?.isReady;
 
   if (isHotSwap) {
-    // Hot-swap: just change the source in GStreamer
-    console.log('Hot-swap: switching source');
-    if (frameBufferService?.isRunning) {
-      webrtcPort = frameBufferService.getOutputPort();
-    }
-    webrtcService.hotSwap('udp', {
-      port: webrtcPort,
-      codec: simulatorCodec
+    // Hot-swap: FrameBuffer handles source changes gracefully
+    console.log('Hot-swap: switching source (FrameBuffer handles transition)');
+    currentSource = `udp://0.0.0.0:${port}`;
+    broadcast({ type: 'source-switching' });
+    return;
+  }
+
+  // Cold start: stop everything and start fresh
+  await stopStream();
+
+  currentSource = `udp://0.0.0.0:${port}`;
+  streamMode = 'udp';
+
+  // Port allocation:
+  // port     = Simulator output, KLV Splitter input
+  // port + 1 = KLV Splitter output, FrameBuffer input
+  let splitterOutputPort = port + 1;
+  const shmPath = '/tmp/framebuffer.sock';
+
+  // Start KLV Splitter first (extracts metadata, forwards stream)
+  try {
+    klvSplitter = new UDPKLVSplitter();
+    await klvSplitter.start({
+      inputPort: port,
+      outputPort: splitterOutputPort,
+      outputHost: '127.0.0.1'
     });
-    currentSource = `udp://0.0.0.0:${port}`;
-  } else {
-    // Cold start: stop everything and start fresh
-    await stopStream();
 
-    currentSource = `udp://0.0.0.0:${port}`;
-    streamMode = 'udp';
-
-    // Port allocation:
-    // port     = Simulator output, KLV Splitter input
-    // port + 1 = KLV Splitter output, FrameBuffer input
-    // port + 2 = FrameBuffer output, WebRTC input
-    let splitterOutputPort = port + 1;
-    let framebufferOutputPort = port + 2;
-
-    // Start KLV Splitter first (extracts metadata, forwards stream)
-    try {
-      klvSplitter = new UDPKLVSplitter();
-      await klvSplitter.start({
-        inputPort: port,
-        outputPort: splitterOutputPort,
-        outputHost: '127.0.0.1'
-      });
-
-      // Handle KLV events from splitter
-      klvSplitter.on('klv', (klvData) => {
-        try {
-          const { packets } = parseKLV(klvData);
-          for (const packet of packets) {
-            const formatted = formatKLVForDisplay(packet);
-            broadcast({ type: 'klv', data: formatted });
-          }
-        } catch (error) {
-          // KLV parsing errors are common
-        }
-      });
-    } catch (error) {
-      console.warn('KLV Splitter failed:', error.message);
-      klvSplitter = null;
-      splitterOutputPort = port; // Fallback: FrameBuffer reads directly
-    }
-
-    // Start FrameBuffer if enabled (ultra-stable frame synchronization)
-    // Output modes: 'vp8' (WebRTC-ready), 'raw' (no encode), 'h264' (MPEG-TS)
-    let outputMode = 'vp8';  // Use VP8 output - single encode, WebRTC-ready
-
-    if (useFrameBuffer) {
+    // Handle KLV events from splitter
+    klvSplitter.on('klv', (klvData) => {
       try {
-        frameBufferService = new FrameBufferService();
-        await frameBufferService.start({
-          inputPort: splitterOutputPort,
-          outputPort: framebufferOutputPort,
-          outputHost: '127.0.0.1',
-          width: 640,
-          height: 480,
-          fps: 25,
-          bitrate: 2000,
-          vp8Output: outputMode === 'vp8',
-          rawOutput: outputMode === 'raw'
-        });
-        console.log(`FrameBuffer started (${outputMode.toUpperCase()} mode)`);
-        webrtcPort = framebufferOutputPort;
-        console.log(`FrameBuffer: Input ${splitterOutputPort} -> Output ${webrtcPort}`);
-
-        // Listen for stats events
-        frameBufferService.on('stats', (stats) => {
-          broadcast({ type: 'framebuffer-stats', stats });
-        });
+        const { packets } = parseKLV(klvData);
+        for (const packet of packets) {
+          const formatted = formatKLVForDisplay(packet);
+          broadcast({ type: 'klv', data: formatted });
+        }
       } catch (error) {
-        console.warn('FrameBuffer not available, using direct input:', error.message);
-        frameBufferService = null;
-        webrtcPort = splitterOutputPort;
-        outputMode = 'h264';  // Fallback to H.264 MPEG-TS
+        // KLV parsing errors are common
       }
-    } else {
-      webrtcPort = splitterOutputPort;
-      outputMode = 'h264';
-    }
+    });
+  } catch (error) {
+    console.warn('KLV Splitter failed:', error.message);
+    klvSplitter = null;
+    splitterOutputPort = port; // Fallback: FrameBuffer reads directly
+  }
 
-    // Reinitialize service if needed
-    if (!webrtcService) {
-      webrtcService = setupWebRTCService();
-    }
+  // ===== NEW VP8 RTP ARCHITECTURE =====
+  // FrameBuffer (-v) → VP8 RTP UDP → UDPDuplicator → webrtc-gateway → WebRTC
+  //                                               → ffplay (monitor port)
+  // This preserves the perfect timing from FrameBuffer's VP8 output
+  if (useShmArchitecture && useFrameBuffer) {
+    const framebufferOutputPort = port + 3;  // FrameBuffer outputs here
+    const webrtcGatewayPort = port + 2;      // WebRTC gateway listens here
 
-    // Start GStreamer WebRTC pipeline
     try {
-      await webrtcService.start('udp', {
-        port: webrtcPort,
-        codec: simulatorCodec,
-        vp8: outputMode === 'vp8',   // VP8 RTP passthrough (no encode)
-        raw: outputMode === 'raw',   // Raw RTP input (encode to VP8)
-        width: 640,                  // Must match FrameBuffer output
-        height: 480
+      // Start FrameBuffer with VP8 RTP output
+      // MPEG2 4K decodes at ~4fps, so use 5fps to minimize repeated frames
+      // H.264 typically decodes fast enough for 15fps
+      const isMpeg2 = simulatorCodec === 'mpeg2';
+      const outputFps = isMpeg2 ? 5 : 15;
+      console.log(`Output fps: ${outputFps} (codec: ${simulatorCodec || 'unknown'})`);
+      frameBufferService = new FrameBufferService();
+      await frameBufferService.start({
+        inputPort: splitterOutputPort,
+        outputPort: framebufferOutputPort,
+        outputHost: '127.0.0.1',
+        width: 640,
+        height: 480,
+        fps: outputFps,
+        bitrate: 2000,
+        vp8Output: true  // VP8 RTP output (perfect timing)
       });
-      console.log(`WebRTC pipeline started on port ${webrtcPort} (${outputMode.toUpperCase()} mode)`);
-    } catch (error) {
-      console.error('Failed to start WebRTC:', error);
-      broadcast({ type: 'error', message: error.message });
+      console.log(`FrameBuffer started (VP8 RTP mode @ ${outputFps}fps) -> UDP:${framebufferOutputPort}`);
+
+      // Listen for stats events
+      frameBufferService.on('stats', (stats) => {
+        broadcast({ type: 'framebuffer-stats', stats });
+      });
+
+      // Start UDP Duplicator to split stream for WebRTC and monitoring
+      udpDuplicator = new UDPDuplicator();
+      udpDuplicator.start(framebufferOutputPort, [
+        { host: '127.0.0.1', port: webrtcGatewayPort },  // For webrtc-gateway
+        { host: '127.0.0.1', port: MONITOR_PORT }        // For ffplay monitoring
+      ]);
+      console.log(`UDP Duplicator: ${framebufferOutputPort} -> ${webrtcGatewayPort} + ${MONITOR_PORT} (monitor)`);
+
+      // Start WebRTC Gateway (receives VP8 RTP from duplicator)
+      webrtcGateway = setupWebRTCGateway();
+      await webrtcGateway.start({
+        udpPort: webrtcGatewayPort
+      });
+      console.log(`WebRTC Gateway started (listening on UDP:${webrtcGatewayPort})`);
+
+      broadcast({
+        type: 'stream-started',
+        mode: 'udp',
+        source: currentSource,
+        webrtc: true,
+        architecture: 'vp8-rtp',
+        framebuffer: true,
+        monitorPort: MONITOR_PORT
+      });
+
+      console.log(`\n>>> Monitor with ffplay: ffplay -protocol_whitelist file,udp,rtp -i rtp://127.0.0.1:${MONITOR_PORT}\n`);
+
       return;
+    } catch (error) {
+      console.warn('VP8 RTP architecture failed, falling back to legacy:', error.message);
+      // Clean up partial state
+      if (frameBufferService?.isRunning) {
+        await frameBufferService.stop();
+        frameBufferService = null;
+      }
+      if (udpDuplicator?.isRunning) {
+        udpDuplicator.stop();
+        udpDuplicator = null;
+      }
+      if (webrtcGateway) {
+        await webrtcGateway.stop();
+        webrtcGateway = null;
+      }
+      // Fall through to legacy architecture
     }
   }
 
+  // ===== LEGACY ARCHITECTURE =====
+  // FrameBuffer → VP8 UDP → Python WebRTC
+  let webrtcPort = port;
+  let framebufferOutputPort = port + 2;
+  let outputMode = 'vp8';
+
+  if (useFrameBuffer) {
+    try {
+      frameBufferService = new FrameBufferService();
+      await frameBufferService.start({
+        inputPort: splitterOutputPort,
+        outputPort: framebufferOutputPort,
+        outputHost: '127.0.0.1',
+        width: 640,
+        height: 480,
+        fps: 25,
+        bitrate: 2000,
+        vp8Output: outputMode === 'vp8',
+        rawOutput: outputMode === 'raw'
+      });
+      console.log(`FrameBuffer started (${outputMode.toUpperCase()} mode)`);
+      webrtcPort = framebufferOutputPort;
+      console.log(`FrameBuffer: Input ${splitterOutputPort} -> Output ${webrtcPort}`);
+
+      // Listen for stats events
+      frameBufferService.on('stats', (stats) => {
+        broadcast({ type: 'framebuffer-stats', stats });
+      });
+    } catch (error) {
+      console.warn('FrameBuffer not available, using direct input:', error.message);
+      frameBufferService = null;
+      webrtcPort = splitterOutputPort;
+      outputMode = 'h264';  // Fallback to H.264 MPEG-TS
+    }
+  } else {
+    webrtcPort = splitterOutputPort;
+    outputMode = 'h264';
+  }
+
+  // Reinitialize service if needed
+  if (!webrtcService) {
+    webrtcService = setupWebRTCService();
+  }
+
+  // Start GStreamer WebRTC pipeline
+  try {
+    await webrtcService.start('udp', {
+      port: webrtcPort,
+      codec: simulatorCodec,
+      vp8: outputMode === 'vp8',   // VP8 RTP passthrough (no encode)
+      raw: outputMode === 'raw',   // Raw RTP input (encode to VP8)
+      width: 640,                  // Must match FrameBuffer output
+      height: 480
+    });
+    console.log(`WebRTC pipeline started on port ${webrtcPort} (${outputMode.toUpperCase()} mode)`);
+  } catch (error) {
+    console.error('Failed to start WebRTC:', error);
+    broadcast({ type: 'error', message: error.message });
+    return;
+  }
+
   broadcast({
-    type: isHotSwap ? 'stream-switched' : 'stream-started',
+    type: 'stream-started',
     mode: 'udp',
     source: currentSource,
     webrtc: true,
+    architecture: 'legacy',
     framebuffer: frameBufferService?.isRunning || false
   });
 }
@@ -462,6 +627,11 @@ async function stopStream() {
     ffmpegService = null;
   }
 
+  if (webrtcGateway?.isReady) {
+    await webrtcGateway.stop();
+    webrtcGateway = null;
+  }
+
   if (webrtcService?.isReady) {
     await webrtcService.stop();
     // Reinitialize for next use
@@ -478,6 +648,11 @@ async function stopStream() {
     klvSplitter = null;
   }
 
+  if (udpDuplicator?.isRunning) {
+    udpDuplicator.stop();
+    udpDuplicator = null;
+  }
+
   currentSource = null;
   streamMode = null;
   broadcast({ type: 'stream-stopped' });
@@ -486,13 +661,15 @@ async function stopStream() {
 // ===== REST API =====
 app.get('/api/status', (req, res) => {
   res.json({
-    streaming: !!(ffmpegService || webrtcService?.isReady),
+    streaming: !!(ffmpegService || webrtcService?.isReady || webrtcGateway?.isReady),
     source: currentSource,
     mode: streamMode,
     clients: clients.size,
-    webrtcReady: webrtcService?.isReady || false,
+    webrtcReady: webrtcService?.isReady || webrtcGateway?.isReady || false,
+    architecture: useShmArchitecture ? 'shm' : 'legacy',
     simulator: simulatorProcess ? { running: true, codec: simulatorCodec } : { running: false },
     webrtc: webrtcService?.getStatus() || null,
+    webrtcGateway: webrtcGateway?.getStatus() || { running: false },
     framebuffer: frameBufferService?.getStatus() || { running: false },
     processes: orchestrator.getAllStatus()
   });
@@ -635,17 +812,25 @@ app.post('/api/simulator/start', async (req, res) => {
   simulatorCodec = file.codec || 'h264';
   console.log(`Simulator started: ${file.name} -> udp://127.0.0.1:${port} (PID: ${simulatorProcess.pid}, codec: ${simulatorCodec})`);
 
-  // Handle source switch when UDP stream is running
-  // With FrameBuffer, we do NOT need to restart the pipeline!
-  // FrameBuffer handles source changes gracefully by continuing to output
-  // the last frame until new frames arrive from the new source.
-  if (streamMode === 'udp' && webrtcService?.isReady) {
+  // Check if UDP stream is already running
+  const webrtcReady = webrtcService?.isReady || webrtcGateway?.isReady;
+
+  if (streamMode === 'udp' && webrtcReady) {
+    // Handle source switch when UDP stream is running
+    // With FrameBuffer, we do NOT need to restart the pipeline!
     console.log(`Source switch to ${file.name} - FrameBuffer will handle transition`);
     broadcast({ type: 'source-switching', file: file.name });
-    // No restart needed - FrameBuffer is resilient to source changes
+    res.json({ success: true, file: file.name, port, codec: simulatorCodec });
+  } else {
+    // Start UDP stream processing (KLV splitter, FrameBuffer, WebRTC Gateway)
+    try {
+      await startUDPStream(port);
+      res.json({ success: true, file: file.name, port, codec: simulatorCodec });
+    } catch (error) {
+      console.error('Failed to start UDP stream:', error);
+      res.json({ success: true, file: file.name, port, codec: simulatorCodec, warning: 'Simulator started but stream processing failed' });
+    }
   }
-
-  res.json({ success: true, file: file.name, port, codec: simulatorCodec });
 });
 
 app.post('/api/simulator/stop', async (req, res) => {

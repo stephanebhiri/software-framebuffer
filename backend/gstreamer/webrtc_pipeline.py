@@ -342,8 +342,8 @@ class WebRTCPipeline:
 
         if vp8_input:
             # ===== VP8 RTP MODE =====
-            # Direct VP8 RTP from FrameBuffer -v flag - zero encode in Python!
-            # Pipeline: udpsrc -> rtpvp8depay -> rtpvp8pay -> webrtcbin
+            # Direct VP8 RTP from FrameBuffer -v flag - minimal processing
+            # Pipeline: udpsrc -> jitterbuffer -> rtpvp8depay -> rtpvp8pay -> webrtcbin
             self._log("Using VP8 RTP input mode (passthrough, no encode needed)")
 
             # Set caps for VP8 RTP
@@ -352,16 +352,32 @@ class WebRTCPipeline:
             )
             udpsrc.set_property("caps", rtp_caps)
 
+            # Jitter buffer for smooth playback
+            jitterbuffer = Gst.ElementFactory.make("rtpjitterbuffer", "jitterbuffer")
+            jitterbuffer.set_property("latency", 40)  # 40ms buffer
+            jitterbuffer.set_property("drop-on-latency", True)
+            jitterbuffer.set_property("mode", 0)  # 0=slave, sync to clock
+
             rtpvp8depay = Gst.ElementFactory.make("rtpvp8depay", "rtpvp8depay")
 
-            # Add elements - note: we skip encoder since VP8 is already encoded
-            for elem in [udpsrc, queue1, rtpvp8depay,
+            # Optimize rtppay for low latency
+            self.rtppay.set_property("mtu", 1200)
+            self.rtppay.set_property("picture-id-mode", 1)  # 15-bit picture ID
+
+            # Minimal queue - just for thread decoupling
+            queue1.set_property("max-size-buffers", 3)
+            queue1.set_property("max-size-time", 0)
+            queue1.set_property("max-size-bytes", 0)
+
+            # Add elements
+            for elem in [udpsrc, jitterbuffer, queue1, rtpvp8depay,
                          self.rtppay, self.tee,
                          vlc_queue, vlc_udpsink]:
                 self.pipeline.add(elem)
 
-            # Link: udpsrc -> queue -> rtpvp8depay -> rtpvp8pay -> tee
-            udpsrc.link(queue1)
+            # Link: udpsrc -> jitterbuffer -> queue -> rtpvp8depay -> rtpvp8pay -> tee
+            udpsrc.link(jitterbuffer)
+            jitterbuffer.link(queue1)
             queue1.link(rtpvp8depay)
             rtpvp8depay.link(self.rtppay)
             self.rtppay.link(self.tee)
