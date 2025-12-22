@@ -20,7 +20,7 @@
 #include <getopt.h>
 
 /* ========== Version ========== */
-#define VERSION "1.0.0"
+#define VERSION "1.1.0"
 
 /* ========== Default Configuration ========== */
 
@@ -47,13 +47,35 @@
 #define DEFAULT_APPSINK_MAX_BUFFERS 2
 #define DEFAULT_STATS_INTERVAL_SEC  5
 
-/* VP8 encoder defaults */
-#define DEFAULT_VP8_DEADLINE        1           /* Real-time */
-#define DEFAULT_VP8_CPU_USED        4           /* Speed vs quality */
-
-/* x264 encoder defaults */
+/* Encoder defaults */
 #define DEFAULT_X264_TUNE           "zerolatency"
 #define DEFAULT_X264_PRESET         "ultrafast"
+#define DEFAULT_X265_TUNE           "zerolatency"
+#define DEFAULT_X265_PRESET         "ultrafast"
+#define DEFAULT_VP8_DEADLINE        1           /* Real-time */
+#define DEFAULT_VP8_CPU_USED        4           /* Speed vs quality */
+#define DEFAULT_VP9_DEADLINE        1
+#define DEFAULT_VP9_CPU_USED        4
+
+/* RTP defaults */
+#define DEFAULT_RTP_MTU             1200
+
+/* ========== Enums ========== */
+
+typedef enum {
+    CODEC_RAW,      /* No encoding */
+    CODEC_H264,     /* x264enc */
+    CODEC_H265,     /* x265enc */
+    CODEC_VP8,      /* vp8enc */
+    CODEC_VP9       /* vp9enc */
+} OutputCodec;
+
+typedef enum {
+    CONTAINER_RTP,      /* RTP payload over UDP */
+    CONTAINER_MPEGTS,   /* MPEG-TS over UDP */
+    CONTAINER_SHM,      /* Shared memory (raw frames) */
+    CONTAINER_RAW_UDP   /* Raw bitstream over UDP (no container) */
+} OutputContainer;
 
 /* ========== Data Structures ========== */
 
@@ -63,8 +85,8 @@ typedef struct {
     GstElement *output_pipeline;
 
     /* Key elements */
-    GstElement *appsink;      /* Receives decoded frames */
-    GstElement *appsrc;       /* Pushes frames at fixed rate */
+    GstElement *appsink;
+    GstElement *appsrc;
 
     /* Frame buffer (single frame, mutex protected) */
     GstBuffer *current_frame;
@@ -79,8 +101,8 @@ typedef struct {
     guint64 frames_in;
     guint64 frames_out;
     guint64 frames_repeated;
-    guint64 in_seq;           /* Incremented each new frame received */
-    guint64 last_pushed_seq;  /* Last sequence number pushed to output */
+    guint64 in_seq;
+    guint64 last_pushed_seq;
 
     /* Input config */
     gint input_port;
@@ -97,10 +119,9 @@ typedef struct {
     gint bitrate;
     gint keyframe_interval;
 
-    /* Output mode */
-    gboolean raw_output;      /* Output raw video instead of H.264 MPEG-TS */
-    gboolean vp8_output;      /* Output VP8 RTP (for direct WebRTC) */
-    gboolean shm_output;      /* Output to shared memory for WebRTC Gateway */
+    /* Output format */
+    OutputCodec codec;
+    OutputContainer container;
 
     /* Shared memory config */
     gchar *shm_path;
@@ -123,6 +144,46 @@ static GstFlowReturn on_new_sample(GstElement *sink, FrameBuffer *fb);
 static gpointer render_loop(gpointer data);
 static GstBuffer *create_fallback_frame(FrameBuffer *fb);
 static void on_bus_error(GstBus *bus, GstMessage *msg, gpointer data);
+
+/* ========== Helper Functions ========== */
+
+static const char *codec_to_string(OutputCodec codec) {
+    switch (codec) {
+        case CODEC_RAW:  return "raw";
+        case CODEC_H264: return "h264";
+        case CODEC_H265: return "h265";
+        case CODEC_VP8:  return "vp8";
+        case CODEC_VP9:  return "vp9";
+        default:         return "unknown";
+    }
+}
+
+static const char *container_to_string(OutputContainer container) {
+    switch (container) {
+        case CONTAINER_RTP:     return "rtp";
+        case CONTAINER_MPEGTS:  return "mpegts";
+        case CONTAINER_SHM:     return "shm";
+        case CONTAINER_RAW_UDP: return "raw";
+        default:                return "unknown";
+    }
+}
+
+static OutputCodec string_to_codec(const char *str) {
+    if (strcasecmp(str, "raw") == 0 || strcasecmp(str, "none") == 0) return CODEC_RAW;
+    if (strcasecmp(str, "h264") == 0 || strcasecmp(str, "avc") == 0) return CODEC_H264;
+    if (strcasecmp(str, "h265") == 0 || strcasecmp(str, "hevc") == 0) return CODEC_H265;
+    if (strcasecmp(str, "vp8") == 0) return CODEC_VP8;
+    if (strcasecmp(str, "vp9") == 0) return CODEC_VP9;
+    return CODEC_H264;  /* Default */
+}
+
+static OutputContainer string_to_container(const char *str) {
+    if (strcasecmp(str, "rtp") == 0) return CONTAINER_RTP;
+    if (strcasecmp(str, "mpegts") == 0 || strcasecmp(str, "ts") == 0) return CONTAINER_MPEGTS;
+    if (strcasecmp(str, "shm") == 0 || strcasecmp(str, "shmem") == 0) return CONTAINER_SHM;
+    if (strcasecmp(str, "raw") == 0 || strcasecmp(str, "none") == 0) return CONTAINER_RAW_UDP;
+    return CONTAINER_RTP;  /* Default */
+}
 
 /* ========== Bus Error Handler ========== */
 static void on_bus_error(GstBus *bus, GstMessage *msg, gpointer data) {
@@ -163,10 +224,9 @@ static FrameBuffer *framebuffer_new(void) {
     fb->bitrate = DEFAULT_BITRATE_KBPS;
     fb->keyframe_interval = DEFAULT_KEYFRAME_INTERVAL;
 
-    /* Output mode */
-    fb->raw_output = FALSE;
-    fb->vp8_output = FALSE;
-    fb->shm_output = FALSE;
+    /* Output format defaults */
+    fb->codec = CODEC_H264;
+    fb->container = CONTAINER_MPEGTS;
 
     /* Shared memory */
     fb->shm_path = g_strdup(DEFAULT_SHM_PATH);
@@ -188,21 +248,9 @@ static FrameBuffer *framebuffer_new(void) {
 static gboolean create_input_pipeline(FrameBuffer *fb) {
     GError *error = NULL;
 
-    /* Convert milliseconds to nanoseconds for GStreamer */
     guint64 jitter_ns = fb->jitter_buffer_ms * 1000000ULL;
     guint64 max_time_ns = fb->max_queue_time_ms * 1000000ULL;
 
-    /*
-     * Pipeline: UDP -> Jitter Buffer -> Demux -> Decode -> Normalize -> AppSink
-     *
-     * Key elements:
-     * - udpsrc: Receives UDP packets with large socket buffer
-     * - queue with min-threshold-time: JITTER BUFFER - waits before playing
-     * - tsparse: Parses MPEG-TS packets
-     * - decodebin3: Auto-selects decoder (H.264, MPEG-2, etc.)
-     * - videoconvert/videoscale: Normalizes to I420 at target resolution
-     * - appsink: Captures decoded frames
-     */
     gchar *pipeline_str = g_strdup_printf(
         "udpsrc port=%d buffer-size=%" G_GUINT64_FORMAT " "
         "caps=\"video/mpegts,systemstream=true\" name=udpsrc "
@@ -236,25 +284,120 @@ static gboolean create_input_pipeline(FrameBuffer *fb) {
         return FALSE;
     }
 
-    /* Get appsink */
     fb->appsink = gst_bin_get_by_name(GST_BIN(fb->input_pipeline), "sink");
     if (!fb->appsink) {
         g_printerr("[FrameBuffer] Failed to get appsink\n");
         return FALSE;
     }
 
-    /* Connect appsink signal */
     g_signal_connect(fb->appsink, "new-sample", G_CALLBACK(on_new_sample), fb);
 
-    /* Add bus watch for errors */
     GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(fb->input_pipeline));
     gst_bus_add_signal_watch(bus);
     g_signal_connect(bus, "message::error", G_CALLBACK(on_bus_error), (gpointer)"INPUT");
     gst_object_unref(bus);
 
-    g_print("[FrameBuffer] Input: UDP port %d, %"G_GUINT64_FORMAT"ms jitter buffer\n",
+    g_print("[FrameBuffer] Input: UDP port %d, %" G_GUINT64_FORMAT "ms jitter buffer\n",
             fb->input_port, fb->jitter_buffer_ms);
     return TRUE;
+}
+
+/* ========== Build Encoder String ========== */
+static gchar *build_encoder_string(FrameBuffer *fb) {
+    switch (fb->codec) {
+        case CODEC_RAW:
+            return g_strdup("");  /* No encoder */
+
+        case CODEC_H264:
+            return g_strdup_printf(
+                "videoconvert ! x264enc tune=%s speed-preset=%s bitrate=%d key-int-max=%d ! h264parse ",
+                DEFAULT_X264_TUNE, DEFAULT_X264_PRESET,
+                fb->bitrate, fb->keyframe_interval
+            );
+
+        case CODEC_H265:
+            return g_strdup_printf(
+                "videoconvert ! x265enc tune=%s speed-preset=%s bitrate=%d key-int-max=%d ! h265parse ",
+                DEFAULT_X265_TUNE, DEFAULT_X265_PRESET,
+                fb->bitrate, fb->keyframe_interval
+            );
+
+        case CODEC_VP8:
+            return g_strdup_printf(
+                "videoconvert ! vp8enc deadline=%d cpu-used=%d target-bitrate=%d000 keyframe-max-dist=%d ",
+                DEFAULT_VP8_DEADLINE, DEFAULT_VP8_CPU_USED,
+                fb->bitrate, fb->keyframe_interval
+            );
+
+        case CODEC_VP9:
+            return g_strdup_printf(
+                "videoconvert ! vp9enc deadline=%d cpu-used=%d target-bitrate=%d000 keyframe-max-dist=%d ",
+                DEFAULT_VP9_DEADLINE, DEFAULT_VP9_CPU_USED,
+                fb->bitrate, fb->keyframe_interval
+            );
+
+        default:
+            return g_strdup("");
+    }
+}
+
+/* ========== Build Muxer/Payloader String ========== */
+static gchar *build_muxer_string(FrameBuffer *fb) {
+    switch (fb->container) {
+        case CONTAINER_SHM:
+            return g_strdup_printf(
+                "shmsink socket-path=%s shm-size=%" G_GUINT64_FORMAT " wait-for-connection=false sync=false",
+                fb->shm_path, fb->shm_size
+            );
+
+        case CONTAINER_MPEGTS:
+            return g_strdup_printf(
+                "mpegtsmux ! udpsink host=%s port=%d sync=false",
+                fb->output_host, fb->output_port
+            );
+
+        case CONTAINER_RAW_UDP:
+            return g_strdup_printf(
+                "udpsink host=%s port=%d sync=false",
+                fb->output_host, fb->output_port
+            );
+
+        case CONTAINER_RTP:
+        default:
+            /* RTP payloader depends on codec */
+            switch (fb->codec) {
+                case CODEC_RAW:
+                    return g_strdup_printf(
+                        "rtpvrawpay mtu=%d ! udpsink host=%s port=%d sync=false",
+                        DEFAULT_RTP_MTU, fb->output_host, fb->output_port
+                    );
+                case CODEC_H264:
+                    return g_strdup_printf(
+                        "rtph264pay config-interval=1 mtu=%d ! udpsink host=%s port=%d sync=false",
+                        DEFAULT_RTP_MTU, fb->output_host, fb->output_port
+                    );
+                case CODEC_H265:
+                    return g_strdup_printf(
+                        "rtph265pay config-interval=1 mtu=%d ! udpsink host=%s port=%d sync=false",
+                        DEFAULT_RTP_MTU, fb->output_host, fb->output_port
+                    );
+                case CODEC_VP8:
+                    return g_strdup_printf(
+                        "rtpvp8pay mtu=%d ! udpsink host=%s port=%d sync=false",
+                        DEFAULT_RTP_MTU, fb->output_host, fb->output_port
+                    );
+                case CODEC_VP9:
+                    return g_strdup_printf(
+                        "rtpvp9pay mtu=%d ! udpsink host=%s port=%d sync=false",
+                        DEFAULT_RTP_MTU, fb->output_host, fb->output_port
+                    );
+                default:
+                    return g_strdup_printf(
+                        "udpsink host=%s port=%d sync=false",
+                        fb->output_host, fb->output_port
+                    );
+            }
+    }
 }
 
 /* ========== Create Output Pipeline ========== */
@@ -264,63 +407,37 @@ static gboolean create_output_pipeline(FrameBuffer *fb) {
         fb->width, fb->height, fb->fps
     );
 
-    gchar *pipeline_str;
-    const gchar *mode_name;
+    gchar *encoder_str = build_encoder_string(fb);
+    gchar *muxer_str = build_muxer_string(fb);
 
-    if (fb->shm_output) {
-        /* Shared Memory output for IPC with WebRTC Gateway */
+    /* For SHM output with encoded video, we need different handling */
+    gboolean shm_with_encoding = (fb->container == CONTAINER_SHM && fb->codec != CODEC_RAW);
+
+    gchar *pipeline_str;
+    if (fb->container == CONTAINER_SHM && fb->codec == CODEC_RAW) {
+        /* SHM with raw frames - direct output */
         pipeline_str = g_strdup_printf(
-            "appsrc name=src is-live=true format=time do-timestamp=true "
-            "caps=\"%s\" "
-            "! shmsink socket-path=%s shm-size=%" G_GUINT64_FORMAT " "
-            "wait-for-connection=false sync=false",
-            caps_str, fb->shm_path, fb->shm_size
+            "appsrc name=src is-live=true format=time do-timestamp=true caps=\"%s\" ! %s",
+            caps_str, muxer_str
         );
-        mode_name = "Shared Memory";
-    } else if (fb->vp8_output) {
-        /* VP8 RTP output - WebRTC-ready */
+    } else if (shm_with_encoding) {
+        /* SHM with encoded video - not typical but supported */
         pipeline_str = g_strdup_printf(
-            "appsrc name=src is-live=true format=time do-timestamp=true "
-            "caps=\"%s\" "
-            "! videoconvert "
-            "! vp8enc deadline=%d cpu-used=%d target-bitrate=%d000 keyframe-max-dist=%d "
-            "! rtpvp8pay mtu=1200 "
-            "! udpsink host=%s port=%d sync=false",
-            caps_str,
-            DEFAULT_VP8_DEADLINE, DEFAULT_VP8_CPU_USED,
-            fb->bitrate, fb->keyframe_interval,
-            fb->output_host, fb->output_port
+            "appsrc name=src is-live=true format=time do-timestamp=true caps=\"%s\" ! %s%s",
+            caps_str, encoder_str, muxer_str
         );
-        mode_name = "VP8 RTP";
-    } else if (fb->raw_output) {
-        /* Raw RTP output - no encoding */
-        pipeline_str = g_strdup_printf(
-            "appsrc name=src is-live=true format=time do-timestamp=true "
-            "caps=\"%s\" "
-            "! rtpvrawpay mtu=1400 "
-            "! udpsink host=%s port=%d sync=false",
-            caps_str, fb->output_host, fb->output_port
-        );
-        mode_name = "Raw RTP";
     } else {
-        /* H.264 MPEG-TS output (default) */
+        /* Normal UDP output */
         pipeline_str = g_strdup_printf(
-            "appsrc name=src is-live=true format=time do-timestamp=false "
-            "caps=\"%s\" "
-            "! videoconvert "
-            "! x264enc tune=%s speed-preset=%s bitrate=%d key-int-max=%d "
-            "! h264parse "
-            "! mpegtsmux "
-            "! udpsink host=%s port=%d sync=false",
-            caps_str,
-            DEFAULT_X264_TUNE, DEFAULT_X264_PRESET,
-            fb->bitrate, fb->keyframe_interval,
-            fb->output_host, fb->output_port
+            "appsrc name=src is-live=true format=time do-timestamp=%s caps=\"%s\" ! %s%s",
+            (fb->codec == CODEC_RAW) ? "true" : "false",
+            caps_str, encoder_str, muxer_str
         );
-        mode_name = "H.264 MPEG-TS";
     }
 
     g_free(caps_str);
+    g_free(encoder_str);
+    g_free(muxer_str);
 
     if (fb->verbose) {
         g_print("[FrameBuffer] Output pipeline: %s\n", pipeline_str);
@@ -336,16 +453,22 @@ static gboolean create_output_pipeline(FrameBuffer *fb) {
         return FALSE;
     }
 
-    /* Get appsrc */
     fb->appsrc = gst_bin_get_by_name(GST_BIN(fb->output_pipeline), "src");
 
-    if (fb->shm_output) {
-        g_print("[FrameBuffer] Output: %s @ %s, %dx%d @ %dfps\n",
-                mode_name, fb->shm_path, fb->width, fb->height, fb->fps);
+    /* Print output info */
+    if (fb->container == CONTAINER_SHM) {
+        g_print("[FrameBuffer] Output: %s/%s @ %s, %dx%d @ %dfps\n",
+                codec_to_string(fb->codec), container_to_string(fb->container),
+                fb->shm_path, fb->width, fb->height, fb->fps);
     } else {
-        g_print("[FrameBuffer] Output: %s @ %s:%d, %dx%d @ %dfps, %dkbps\n",
-                mode_name, fb->output_host, fb->output_port,
-                fb->width, fb->height, fb->fps, fb->bitrate);
+        g_print("[FrameBuffer] Output: %s/%s @ %s:%d, %dx%d @ %dfps",
+                codec_to_string(fb->codec), container_to_string(fb->container),
+                fb->output_host, fb->output_port,
+                fb->width, fb->height, fb->fps);
+        if (fb->codec != CODEC_RAW) {
+            g_print(", %dkbps", fb->bitrate);
+        }
+        g_print("\n");
     }
 
     return TRUE;
@@ -361,13 +484,11 @@ static GstFlowReturn on_new_sample(GstElement *sink, FrameBuffer *fb) {
 
     g_mutex_lock(&fb->frame_mutex);
 
-    /* Replace current frame */
     if (fb->current_frame) {
         gst_buffer_unref(fb->current_frame);
     }
     fb->current_frame = gst_buffer_ref(buffer);
 
-    /* Update caps if changed */
     if (caps && (!fb->current_caps || !gst_caps_is_equal(caps, fb->current_caps))) {
         if (fb->current_caps) gst_caps_unref(fb->current_caps);
         fb->current_caps = gst_caps_ref(caps);
@@ -387,17 +508,14 @@ static GstFlowReturn on_new_sample(GstElement *sink, FrameBuffer *fb) {
 static GstBuffer *create_fallback_frame(FrameBuffer *fb) {
     gsize y_size = fb->width * fb->height;
     gsize uv_size = y_size / 4;
-    gsize total_size = y_size + 2 * uv_size;  /* I420 format */
+    gsize total_size = y_size + 2 * uv_size;
 
     GstBuffer *buffer = gst_buffer_new_allocate(NULL, total_size, NULL);
 
     GstMapInfo map;
     gst_buffer_map(buffer, &map, GST_MAP_WRITE);
 
-    /* Y plane: gray (128) */
     memset(map.data, 128, y_size);
-
-    /* U and V planes: neutral (128) */
     memset(map.data + y_size, 128, uv_size);
     memset(map.data + y_size + uv_size, 128, uv_size);
 
@@ -410,7 +528,6 @@ static GstBuffer *create_fallback_frame(FrameBuffer *fb) {
 static gpointer render_loop(gpointer data) {
     FrameBuffer *fb = (FrameBuffer *)data;
 
-    /* Compute frame duration from configured fps */
     GstClockTime frame_duration = gst_util_uint64_scale_int(GST_SECOND, 1, fb->fps);
 
     g_print("[FrameBuffer] Render loop started (%d fps, frame=%" G_GUINT64_FORMAT "ns)\n",
@@ -424,14 +541,13 @@ static gpointer render_loop(gpointer data) {
 
     GstClockTime base_time = gst_element_get_base_time(GST_ELEMENT(fb->output_pipeline));
     guint64 frame_count = 0;
-    guint64 stats_frames = fb->fps * fb->stats_interval;
+    guint64 stats_frames = (fb->stats_interval > 0) ? fb->fps * fb->stats_interval : 0;
 
     while (fb->running) {
         GstBuffer *buffer_to_push = NULL;
         gboolean is_repeat = FALSE;
         guint64 current_seq = 0;
 
-        /* Get current frame (or create fallback) */
         g_mutex_lock(&fb->frame_mutex);
 
         if (fb->current_frame) {
@@ -444,19 +560,16 @@ static gpointer render_loop(gpointer data) {
 
         g_mutex_unlock(&fb->frame_mutex);
 
-        /* Detect frame repeat */
         if (!is_repeat && current_seq == fb->last_pushed_seq) {
             is_repeat = TRUE;
         }
         fb->last_pushed_seq = current_seq;
 
-        /* Set timestamps */
         GstClockTime pts = frame_count * frame_duration;
         GST_BUFFER_PTS(buffer_to_push) = pts;
         GST_BUFFER_DTS(buffer_to_push) = pts;
         GST_BUFFER_DURATION(buffer_to_push) = frame_duration;
 
-        /* Push to output */
         GstFlowReturn ret = gst_app_src_push_buffer(
             GST_APP_SRC(fb->appsrc), buffer_to_push);
 
@@ -468,7 +581,6 @@ static gpointer render_loop(gpointer data) {
         if (is_repeat) fb->frames_repeated++;
         frame_count++;
 
-        /* Stats */
         if (stats_frames > 0 && (frame_count % stats_frames) == 0) {
             g_print("[FrameBuffer] Stats: in=%" G_GUINT64_FORMAT
                     " out=%" G_GUINT64_FORMAT
@@ -476,7 +588,6 @@ static gpointer render_loop(gpointer data) {
                     fb->frames_in, fb->frames_out, fb->frames_repeated);
         }
 
-        /* Wait until next frame time */
         GstClockTime running_time = frame_count * frame_duration;
         GstClockTime target_time = base_time + running_time;
         GstClockID clk_id = gst_clock_new_single_shot_id(clock, target_time);
@@ -496,14 +607,11 @@ static gboolean start_pipelines_idle(gpointer data) {
 
     g_print("[FrameBuffer] Starting pipelines...\n");
 
-    /* Start output pipeline first */
     gst_element_set_state(fb->output_pipeline, GST_STATE_PLAYING);
 
-    /* Start render loop */
     fb->running = TRUE;
     fb->render_thread = g_thread_new("render-loop", render_loop, fb);
 
-    /* Start input pipeline */
     gst_element_set_state(fb->input_pipeline, GST_STATE_PLAYING);
 
     g_print("[FrameBuffer] Running\n");
@@ -579,12 +687,14 @@ static void print_usage(const char *prog) {
     g_print("  -k, --keyframe INT         Keyframe interval / GOP size (default: %d)\n", DEFAULT_KEYFRAME_INTERVAL);
     g_print("\n");
 
-    g_print("OUTPUT MODES (mutually exclusive):\n");
-    g_print("  (default)                  H.264 MPEG-TS over UDP\n");
-    g_print("  -r, --raw                  Raw RTP video (no encoding)\n");
-    g_print("  -v, --vp8                  VP8 RTP (WebRTC-ready)\n");
-    g_print("  -s, --shm [PATH]           Shared memory output (default: %s)\n", DEFAULT_SHM_PATH);
-    g_print("      --shm-size SIZE        Shared memory size in bytes (default: %d)\n", DEFAULT_SHM_SIZE);
+    g_print("OUTPUT FORMAT:\n");
+    g_print("  -c, --codec CODEC          Output codec: raw, h264, h265, vp8, vp9 (default: h264)\n");
+    g_print("  -C, --container CONT       Container: rtp, mpegts, shm, raw (default: mpegts)\n");
+    g_print("\n");
+
+    g_print("SHARED MEMORY OPTIONS (when -C shm):\n");
+    g_print("  -p, --shm-path PATH        Shared memory socket path (default: %s)\n", DEFAULT_SHM_PATH);
+    g_print("  -Z, --shm-size SIZE        Shared memory size in bytes (default: %d)\n", DEFAULT_SHM_SIZE);
     g_print("\n");
 
     g_print("OTHER OPTIONS:\n");
@@ -594,11 +704,23 @@ static void print_usage(const char *prog) {
     g_print("      --version              Show version\n");
     g_print("\n");
 
+    g_print("CODEC + CONTAINER COMBINATIONS:\n");
+    g_print("  h264/mpegts   H.264 in MPEG-TS (default, broadcast compatible)\n");
+    g_print("  h264/rtp      H.264 RTP payload (SDP compatible)\n");
+    g_print("  h265/mpegts   H.265/HEVC in MPEG-TS\n");
+    g_print("  h265/rtp      H.265/HEVC RTP payload\n");
+    g_print("  vp8/rtp       VP8 RTP (WebRTC compatible)\n");
+    g_print("  vp9/rtp       VP9 RTP (WebRTC compatible)\n");
+    g_print("  raw/shm       Raw I420 frames to shared memory (IPC)\n");
+    g_print("  raw/rtp       Raw video RTP (high bandwidth)\n");
+    g_print("\n");
+
     g_print("EXAMPLES:\n");
-    g_print("  %s -i 5000 -w 1280 -h 720 -f 30\n", prog);
-    g_print("  %s -i 5000 -s /tmp/fb.sock -w 640 -h 480 -f 30\n", prog);
-    g_print("  %s -i 5000 -v -o 5004 -b 3000\n", prog);
-    g_print("  %s -i 5000 -j 2000 --verbose\n", prog);
+    g_print("  %s -i 5000                                    # H.264/MPEG-TS (default)\n", prog);
+    g_print("  %s -i 5000 -c vp8 -C rtp                      # VP8/RTP for WebRTC\n", prog);
+    g_print("  %s -i 5000 -c h265 -C mpegts -b 4000          # H.265/MPEG-TS 4Mbps\n", prog);
+    g_print("  %s -i 5000 -c raw -C shm -p /tmp/fb.sock      # Raw frames to SHM\n", prog);
+    g_print("  %s -i 5000 -c h264 -C rtp -w 1920 -h 1080     # H.264/RTP 1080p\n", prog);
 }
 
 static void print_version(void) {
@@ -612,7 +734,6 @@ int main(int argc, char *argv[]) {
     FrameBuffer *fb = framebuffer_new();
     g_fb = fb;
 
-    /* Long options */
     static struct option long_options[] = {
         {"input-port",    required_argument, 0, 'i'},
         {"udp-buffer",    required_argument, 0, 'B'},
@@ -625,9 +746,9 @@ int main(int argc, char *argv[]) {
         {"fps",           required_argument, 0, 'f'},
         {"bitrate",       required_argument, 0, 'b'},
         {"keyframe",      required_argument, 0, 'k'},
-        {"raw",           no_argument,       0, 'r'},
-        {"vp8",           no_argument,       0, 'v'},
-        {"shm",           optional_argument, 0, 's'},
+        {"codec",         required_argument, 0, 'c'},
+        {"container",     required_argument, 0, 'C'},
+        {"shm-path",      required_argument, 0, 'p'},
         {"shm-size",      required_argument, 0, 'Z'},
         {"stats-interval",required_argument, 0, 'S'},
         {"verbose",       no_argument,       0, 'V'},
@@ -639,7 +760,7 @@ int main(int argc, char *argv[]) {
     int opt;
     int option_index = 0;
 
-    while ((opt = getopt_long(argc, argv, "i:B:j:Q:o:H:w:h:f:b:k:rvs::Z:S:V",
+    while ((opt = getopt_long(argc, argv, "i:B:j:Q:o:H:w:h:f:b:k:c:C:p:Z:S:V",
                               long_options, &option_index)) != -1) {
         switch (opt) {
             case 'i':
@@ -676,18 +797,15 @@ int main(int argc, char *argv[]) {
             case 'k':
                 fb->keyframe_interval = atoi(optarg);
                 break;
-            case 'r':
-                fb->raw_output = TRUE;
+            case 'c':
+                fb->codec = string_to_codec(optarg);
                 break;
-            case 'v':
-                fb->vp8_output = TRUE;
+            case 'C':
+                fb->container = string_to_container(optarg);
                 break;
-            case 's':
-                fb->shm_output = TRUE;
-                if (optarg) {
-                    g_free(fb->shm_path);
-                    fb->shm_path = g_strdup(optarg);
-                }
+            case 'p':
+                g_free(fb->shm_path);
+                fb->shm_path = g_strdup(optarg);
                 break;
             case 'Z':
                 fb->shm_size = strtoull(optarg, NULL, 10);
@@ -712,11 +830,9 @@ int main(int argc, char *argv[]) {
     g_print("SoftwareFrameBuffer v%s\n", VERSION);
     g_print("========================================\n");
 
-    /* Setup signal handlers */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    /* Create pipelines */
     if (!create_input_pipeline(fb)) {
         g_printerr("Failed to create input pipeline\n");
         return 1;
@@ -727,19 +843,15 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Create main loop */
     fb->loop = g_main_loop_new(NULL, FALSE);
 
-    /* Schedule startup */
     if (!framebuffer_start(fb)) {
         g_printerr("Failed to schedule frame buffer start\n");
         return 1;
     }
 
-    /* Run main loop */
     g_main_loop_run(fb->loop);
 
-    /* Cleanup */
     framebuffer_stop(fb);
     g_main_loop_unref(fb->loop);
     framebuffer_free(fb);

@@ -99,12 +99,13 @@ OUTPUT OPTIONS:
   -b, --bitrate KBPS         Encoder bitrate in kbps (default: 2000)
   -k, --keyframe INT         Keyframe interval / GOP size (default: 30)
 
-OUTPUT MODES (mutually exclusive):
-  (default)                  H.264 MPEG-TS over UDP
-  -r, --raw                  Raw RTP video (no encoding)
-  -v, --vp8                  VP8 RTP (WebRTC-ready)
-  -s, --shm [PATH]           Shared memory output (default: /tmp/framebuffer.sock)
-      --shm-size SIZE        Shared memory size in bytes (default: 20000000)
+OUTPUT FORMAT:
+  -c, --codec CODEC          Output codec: raw, h264, h265, vp8, vp9 (default: h264)
+  -C, --container CONT       Container: rtp, mpegts, shm, raw (default: mpegts)
+
+SHARED MEMORY OPTIONS (when -C shm):
+  -p, --shm-path PATH        Shared memory socket path (default: /tmp/framebuffer.sock)
+  -Z, --shm-size SIZE        Shared memory size in bytes (default: 20000000)
 
 OTHER OPTIONS:
   -S, --stats-interval SEC   Stats print interval, 0=off (default: 5)
@@ -115,14 +116,37 @@ OTHER OPTIONS:
 
 ---
 
-## Output Modes
+## Output Formats
 
-| Mode | Flag | Description | Use Case |
-|------|------|-------------|----------|
-| H.264 MPEG-TS | (default) | Re-encoded H.264 in MPEG-TS container | Standard video distribution |
-| Raw RTP | `-r` | Uncompressed video over RTP | Minimal latency, high bandwidth |
-| VP8 RTP | `-v` | VP8 encoded, RTP payload | Direct WebRTC input |
-| Shared Memory | `-s` | Raw frames via `shmsink` | IPC with WebRTC Gateway |
+### Codecs (`-c`)
+
+| Codec | Description | Use Case |
+|-------|-------------|----------|
+| `raw` | Uncompressed I420 | IPC, minimal latency |
+| `h264` | H.264/AVC (x264enc) | Broadcast, streaming |
+| `h265` | H.265/HEVC (x265enc) | High efficiency |
+| `vp8` | VP8 (vp8enc) | WebRTC compatible |
+| `vp9` | VP9 (vp9enc) | Modern browsers |
+
+### Containers (`-C`)
+
+| Container | Description | Use Case |
+|-----------|-------------|----------|
+| `mpegts` | MPEG-TS over UDP | Broadcast, VLC, ffplay |
+| `rtp` | RTP payload over UDP | SDP-based players, WebRTC |
+| `shm` | Shared memory (shmsink) | IPC with other processes |
+| `raw` | Raw UDP (no container) | Direct consumption |
+
+### Recommended Combinations
+
+| Codec + Container | Command | Use Case |
+|-------------------|---------|----------|
+| h264/mpegts | `-c h264 -C mpegts` | Standard broadcast (default) |
+| h264/rtp | `-c h264 -C rtp` | SDP-based streaming |
+| h265/mpegts | `-c h265 -C mpegts` | High efficiency broadcast |
+| vp8/rtp | `-c vp8 -C rtp` | WebRTC direct input |
+| vp9/rtp | `-c vp9 -C rtp` | Modern WebRTC |
+| raw/shm | `-c raw -C shm` | IPC with WebRTC Gateway |
 
 ---
 
@@ -133,24 +157,34 @@ OTHER OPTIONS:
 ./framebuffer -i 5000
 ```
 
-### HD output (1280x720 @ 30fps):
+### HD output (1280x720 @ 30fps, H.264 MPEG-TS):
 ```bash
 ./framebuffer -i 5000 -w 1280 -h 720 -f 30 -b 4000
+```
+
+### VP8 RTP for direct WebRTC:
+```bash
+./framebuffer -i 5000 -c vp8 -C rtp -o 5004 -b 3000
+```
+
+### H.265/HEVC in MPEG-TS (high efficiency):
+```bash
+./framebuffer -i 5000 -c h265 -C mpegts -b 2000
+```
+
+### Shared memory for WebRTC Gateway:
+```bash
+./framebuffer -i 5000 -c raw -C shm -p /tmp/framebuffer.sock -w 640 -h 480 -f 30
+```
+
+### H.264 RTP for SDP-based players:
+```bash
+./framebuffer -i 5000 -c h264 -C rtp -o 5004
 ```
 
 ### Custom jitter buffer (2 seconds):
 ```bash
 ./framebuffer -i 5000 -j 2000 --verbose
-```
-
-### Shared memory for WebRTC Gateway:
-```bash
-./framebuffer -i 5000 -s /tmp/framebuffer.sock -w 640 -h 480 -f 30
-```
-
-### VP8 RTP for direct WebRTC:
-```bash
-./framebuffer -i 5000 -v -o 5004 -b 3000
 ```
 
 ### Disable stats output:
@@ -226,7 +260,9 @@ UDP MPEG-TS (chaotic input, any codec)
         |
    [appsrc]
         |
-   [shmsink / vp8enc / x264enc]
+   [encoder: raw/h264/h265/vp8/vp9]
+        |
+   [container: rtp/mpegts/shm/raw]
         |
    Stable output (exact fps)
 ```
@@ -303,7 +339,7 @@ Every 5 seconds, stats are printed:
 
 ## Integration with WebRTC Gateway
 
-The shared memory mode (`-s`) is designed for seamless integration:
+The shared memory mode (`-c raw -C shm`) is designed for seamless integration:
 
 ```
 ┌────────────┐     shmsink      ┌─────────────────┐
