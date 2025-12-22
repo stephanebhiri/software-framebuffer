@@ -595,7 +595,6 @@ static gpointer render_loop(gpointer data) {
         return NULL;
     }
 
-    GstClockTime base_time = gst_element_get_base_time(GST_ELEMENT(fb->output_pipeline));
     guint64 frame_count = 0;
     guint64 stats_frames = (fb->stats_interval > 0) ? fb->fps * fb->stats_interval : 0;
     gboolean signal_lost_logged = FALSE;
@@ -618,10 +617,12 @@ static gpointer render_loop(gpointer data) {
 
         g_mutex_lock(&fb->frame_mutex);
 
-        /* Check for no-signal timeout: if last input was more than 5 seconds ago */
-        GstClockTime now = g_get_monotonic_time() * 1000;  /* ns */
+        /* Check for no-signal timeout: if last input was more than 5 seconds ago
+         * g_get_monotonic_time() returns microseconds, convert to nanoseconds */
+        gint64 now_us = g_get_monotonic_time();
+        GstClockTime now_ns = (GstClockTime)now_us * 1000;
         gboolean signal_timeout = (fb->last_input_time > 0) &&
-                                  ((now - fb->last_input_time) > DEFAULT_NO_SIGNAL_TIMEOUT);
+                                  ((now_ns - fb->last_input_time) > DEFAULT_NO_SIGNAL_TIMEOUT);
 
         if (fb->current_frame && !signal_timeout) {
             /* Normal case: we have a valid, recent frame */
@@ -650,10 +651,13 @@ static gpointer render_loop(gpointer data) {
             }
         }
 
-        if (!is_repeat && current_seq == fb->last_pushed_seq) {
-            is_repeat = TRUE;
+        /* Only track sequence for real frames, not fallback (avoid polluting with 0) */
+        if (!use_fallback) {
+            if (current_seq == fb->last_pushed_seq) {
+                is_repeat = TRUE;
+            }
+            fb->last_pushed_seq = current_seq;
         }
-        fb->last_pushed_seq = current_seq;
 
         /* Apply timestamps (do-timestamp=false on appsrc, we are clock master) */
         GST_BUFFER_PTS(buffer_to_push) = pts;
@@ -682,7 +686,9 @@ static gpointer render_loop(gpointer data) {
                     fb->frames_in, fb->frames_out, fb->frames_repeated);
         }
 
-        /* Wait for next frame using same drift-free calculation */
+        /* Wait for next frame using same drift-free calculation
+         * Re-read base_time each iteration to handle PAUSED→PLAYING transitions */
+        GstClockTime base_time = gst_element_get_base_time(GST_ELEMENT(fb->output_pipeline));
         GstClockTime target_running_time = gst_util_uint64_scale_int(frame_count, GST_SECOND, fb->fps);
         GstClockTime target_time = base_time + target_running_time;
         GstClockID clk_id = gst_clock_new_single_shot_id(clock, target_time);
