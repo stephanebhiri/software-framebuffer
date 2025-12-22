@@ -1,12 +1,15 @@
 /**
- * FrameBuffer - Ultra-stable video frame synchronizer
+ * SoftwareFrameBuffer - Ultra-stable video frame synchronizer
  *
  * Concept: Decoupled input/output with render loop
  * - Input: Receives frames whenever they arrive (chaotic)
  * - Buffer: Stores the last good frame
- * - Output: Renders at exactly 25fps (rock-solid)
+ * - Output: Renders at exact fps (rock-solid)
  *
  * Like a camera filming a cinema screen - output is always stable.
+ *
+ * Author: Stephane Bhiri
+ * License: MIT
  */
 
 #include <gst/gst.h>
@@ -14,59 +17,116 @@
 #include <gst/app/gstappsrc.h>
 #include <stdio.h>
 #include <string.h>
+#include <getopt.h>
+
+/* ========== Version ========== */
+#define VERSION "1.0.0"
+
+/* ========== Default Configuration ========== */
+
+/* Input defaults */
+#define DEFAULT_INPUT_PORT          5001
+#define DEFAULT_UDP_BUFFER_SIZE     67108864    /* 64 MB socket buffer */
+#define DEFAULT_JITTER_BUFFER_MS    1000        /* 1 second jitter buffer */
+#define DEFAULT_MAX_QUEUE_TIME_MS   5000        /* 5 seconds max queue */
+
+/* Output defaults */
+#define DEFAULT_OUTPUT_PORT         5002
+#define DEFAULT_OUTPUT_HOST         "127.0.0.1"
+#define DEFAULT_WIDTH               640
+#define DEFAULT_HEIGHT              480
+#define DEFAULT_FPS                 25
+#define DEFAULT_BITRATE_KBPS        2000
+#define DEFAULT_KEYFRAME_INTERVAL   30          /* GOP size */
+
+/* Shared memory defaults */
+#define DEFAULT_SHM_PATH            "/tmp/framebuffer.sock"
+#define DEFAULT_SHM_SIZE            20000000    /* 20 MB shared memory */
+
+/* Appsink/Appsrc defaults */
+#define DEFAULT_APPSINK_MAX_BUFFERS 2
+#define DEFAULT_STATS_INTERVAL_SEC  5
+
+/* VP8 encoder defaults */
+#define DEFAULT_VP8_DEADLINE        1           /* Real-time */
+#define DEFAULT_VP8_CPU_USED        4           /* Speed vs quality */
+
+/* x264 encoder defaults */
+#define DEFAULT_X264_TUNE           "zerolatency"
+#define DEFAULT_X264_PRESET         "ultrafast"
+
+/* ========== Data Structures ========== */
 
 typedef struct {
-    // Pipelines
+    /* Pipelines */
     GstElement *input_pipeline;
     GstElement *output_pipeline;
 
-    // Key elements
-    GstElement *appsink;      // Receives decoded frames
-    GstElement *appsrc;       // Pushes frames at fixed rate
+    /* Key elements */
+    GstElement *appsink;      /* Receives decoded frames */
+    GstElement *appsrc;       /* Pushes frames at fixed rate */
 
-    // Frame buffer (single frame, mutex protected)
+    /* Frame buffer (single frame, mutex protected) */
     GstBuffer *current_frame;
     GstCaps *current_caps;
     GMutex frame_mutex;
 
-    // Render loop
+    /* Render loop */
     GThread *render_thread;
     gboolean running;
 
-    // Stats
+    /* Stats */
     guint64 frames_in;
     guint64 frames_out;
     guint64 frames_repeated;
-    guint64 in_seq;           // Incremented each new frame received
-    guint64 last_pushed_seq;  // Last sequence number pushed to output
+    guint64 in_seq;           /* Incremented each new frame received */
+    guint64 last_pushed_seq;  /* Last sequence number pushed to output */
 
-    // Config
+    /* Input config */
     gint input_port;
+    guint64 udp_buffer_size;
+    guint64 jitter_buffer_ms;
+    guint64 max_queue_time_ms;
+
+    /* Output config */
     gint output_port;
     gchar *output_host;
     gint width;
     gint height;
     gint fps;
     gint bitrate;
-    gboolean raw_output;  // Output raw video instead of H.264 MPEG-TS
-    gboolean vp8_output;  // Output VP8 RTP (for direct WebRTC)
-    gboolean shm_output;  // Output to shared memory for WebRTC Gateway
-    gchar *shm_path;      // Shared memory socket path
+    gint keyframe_interval;
+
+    /* Output mode */
+    gboolean raw_output;      /* Output raw video instead of H.264 MPEG-TS */
+    gboolean vp8_output;      /* Output VP8 RTP (for direct WebRTC) */
+    gboolean shm_output;      /* Output to shared memory for WebRTC Gateway */
+
+    /* Shared memory config */
+    gchar *shm_path;
+    guint64 shm_size;
+
+    /* Appsink config */
+    gint appsink_max_buffers;
+
+    /* Stats config */
+    gint stats_interval;
+
+    /* Verbose output */
+    gboolean verbose;
 
     GMainLoop *loop;
 } FrameBuffer;
 
-// Forward declarations
+/* ========== Forward Declarations ========== */
 static GstFlowReturn on_new_sample(GstElement *sink, FrameBuffer *fb);
 static gpointer render_loop(gpointer data);
 static GstBuffer *create_fallback_frame(FrameBuffer *fb);
 static void on_bus_error(GstBus *bus, GstMessage *msg, gpointer data);
-static void on_demux_pad_added(GstElement *demux, GstPad *pad, gpointer data);
 
-/**
- * Bus error handler
- */
+/* ========== Bus Error Handler ========== */
 static void on_bus_error(GstBus *bus, GstMessage *msg, gpointer data) {
+    (void)bus;
     const char *pipeline_name = (const char *)data;
     GError *err = NULL;
     gchar *debug = NULL;
@@ -80,184 +140,7 @@ static void on_bus_error(GstBus *bus, GstMessage *msg, gpointer data) {
     g_free(debug);
 }
 
-/**
- * Context for safe source switching via pad probe
- */
-typedef struct {
-    GstPad *new_pad;   // New video pad from tsdemux (any codec)
-} SwitchContext;
-
-// Forward declaration for decodebin callback
-static void on_decodebin_pad_added(GstElement *decodebin, GstPad *pad, gpointer data);
-
-/**
- * Pad probe callback for safe source switching
- * Called when the sink pad is blocked - safe to unlink/link
- */
-static GstPadProbeReturn
-on_switch_blocked(GstPad *qsink,
-                  GstPadProbeInfo *info,
-                  gpointer user_data)
-{
-    SwitchContext *ctx = (SwitchContext *)user_data;
-
-    g_print("[FrameBuffer] Sink pad blocked, performing source switch\n");
-
-    /* Unlink old peer if any */
-    GstPad *old_peer = gst_pad_get_peer(qsink);
-    if (old_peer) {
-        g_print("[FrameBuffer] Unlinking old video pad\n");
-        gst_pad_unlink(old_peer, qsink);
-        gst_object_unref(old_peer);
-    }
-
-    /* Link new pad */
-    GstPadLinkReturn ret = gst_pad_link(ctx->new_pad, qsink);
-    if (ret == GST_PAD_LINK_OK) {
-        g_print("[FrameBuffer] Linked new video pad successfully\n");
-    } else {
-        g_printerr("[FrameBuffer] Failed to link new video pad: %d\n", ret);
-    }
-
-    /* Cleanup */
-    gst_object_unref(ctx->new_pad);
-    g_free(ctx);
-
-    /* Remove the probe and unblock dataflow */
-    return GST_PAD_PROBE_REMOVE;
-}
-
-/**
- * Check if caps represent a video format (any codec)
- */
-static gboolean is_video_caps(const gchar *caps_name) {
-    return (g_str_has_prefix(caps_name, "video/x-h264") ||
-            g_str_has_prefix(caps_name, "video/x-h265") ||
-            g_str_has_prefix(caps_name, "video/mpeg") ||
-            g_str_has_prefix(caps_name, "video/x-vp8") ||
-            g_str_has_prefix(caps_name, "video/x-vp9") ||
-            g_str_has_prefix(caps_name, "video/x-av1") ||
-            g_str_has_prefix(caps_name, "video/x-raw"));
-}
-
-/**
- * Callback when decodebin creates a src pad (decoded video ready)
- */
-static void on_decodebin_pad_added(GstElement *decodebin, GstPad *pad, gpointer data) {
-    GstElement *videoconvert = (GstElement *)data;
-
-    GstCaps *caps = gst_pad_get_current_caps(pad);
-    if (!caps) caps = gst_pad_query_caps(pad, NULL);
-    if (!caps) return;
-
-    const GstStructure *s = gst_caps_get_structure(caps, 0);
-    const gchar *name = gst_structure_get_name(s);
-
-    // Only link video/x-raw pads (decoded video)
-    if (g_str_has_prefix(name, "video/x-raw")) {
-        GstPad *sink_pad = gst_element_get_static_pad(videoconvert, "sink");
-        if (sink_pad && !gst_pad_is_linked(sink_pad)) {
-            GstPadLinkReturn ret = gst_pad_link(pad, sink_pad);
-            if (ret == GST_PAD_LINK_OK) {
-                g_print("[FrameBuffer] Linked decodebin to videoconvert\n");
-            } else {
-                g_printerr("[FrameBuffer] Failed to link decodebin: %d\n", ret);
-            }
-        }
-        if (sink_pad) gst_object_unref(sink_pad);
-    }
-
-    gst_caps_unref(caps);
-}
-
-/**
- * Helper to link a pad to a new fakesink
- */
-static void link_pad_to_fakesink(GstElement *demux, GstPad *pad) {
-    GstElement *pipeline = GST_ELEMENT(gst_element_get_parent(demux));
-    if (pipeline) {
-        GstElement *fakesink = gst_element_factory_make("fakesink", NULL);
-        if (fakesink) {
-            g_object_set(fakesink, "sync", FALSE, "async", FALSE, NULL);
-            gst_bin_add(GST_BIN(pipeline), fakesink);
-            gst_element_sync_state_with_parent(fakesink);
-
-            GstPad *fsink = gst_element_get_static_pad(fakesink, "sink");
-            if (fsink) {
-                gst_pad_link(pad, fsink);
-                gst_object_unref(fsink);
-            }
-        }
-        gst_object_unref(pipeline);
-    }
-}
-
-/**
- * Handle new pads from tsdemux - safe source switching with pad probe blocking
- * Now codec-agnostic: accepts H.264, H.265/HEVC, MPEG-2, etc.
- */
-static void on_demux_pad_added(GstElement *demux, GstPad *pad, gpointer data) {
-    GstElement *decodebin = (GstElement *)data;
-
-    GstCaps *caps = gst_pad_get_current_caps(pad);
-    if (!caps) caps = gst_pad_query_caps(pad, NULL);
-    if (!caps) return;
-
-    const GstStructure *s = gst_caps_get_structure(caps, 0);
-    const gchar *name = gst_structure_get_name(s);
-
-    g_print("[FrameBuffer] Demux pad: %s (%s)\n", GST_PAD_NAME(pad), name);
-
-    gboolean handled = FALSE;
-
-    // For ANY video format: link to decodebin (with safe switching if needed)
-    if (is_video_caps(name)) {
-        GstPad *dbsink = gst_element_get_static_pad(decodebin, "sink");
-
-        if (dbsink) {
-            if (gst_pad_is_linked(dbsink)) {
-                // Already linked - schedule safe source switch via pad probe
-                SwitchContext *ctx = g_new0(SwitchContext, 1);
-                ctx->new_pad = gst_object_ref(pad);
-
-                g_print("[FrameBuffer] Scheduling safe source switch\n");
-
-                // Use IDLE probe - fires when pad is idle, doesn't require data flow
-                // This handles the case where old source stops before probe fires
-                gst_pad_add_probe(
-                    dbsink,
-                    GST_PAD_PROBE_TYPE_IDLE,
-                    on_switch_blocked,
-                    ctx,
-                    NULL
-                );
-                handled = TRUE;
-            } else {
-                // First-time link (no need to block)
-                GstPadLinkReturn ret = gst_pad_link(pad, dbsink);
-                if (ret == GST_PAD_LINK_OK) {
-                    g_print("[FrameBuffer] Linked initial video pad\n");
-                    handled = TRUE;
-                } else {
-                    g_printerr("[FrameBuffer] Failed to link initial video pad: %d\n", ret);
-                }
-            }
-
-            gst_object_unref(dbsink);
-        }
-    }
-
-    // Non-video pads (and failed links) go to fakesink
-    if (!handled) {
-        link_pad_to_fakesink(demux, pad);
-    }
-
-    gst_caps_unref(caps);
-}
-
-/**
- * Initialize frame buffer
- */
+/* ========== Initialize FrameBuffer with Defaults ========== */
 static FrameBuffer *framebuffer_new(void) {
     FrameBuffer *fb = g_new0(FrameBuffer, 1);
     g_mutex_init(&fb->frame_mutex);
@@ -265,47 +148,84 @@ static FrameBuffer *framebuffer_new(void) {
     fb->current_frame = NULL;
     fb->current_caps = NULL;
 
-    // Defaults
-    fb->input_port = 5001;
-    fb->output_port = 5002;
-    fb->output_host = g_strdup("127.0.0.1");
-    fb->width = 640;
-    fb->height = 480;
-    fb->fps = 25;
-    fb->bitrate = 2000;
+    /* Input defaults */
+    fb->input_port = DEFAULT_INPUT_PORT;
+    fb->udp_buffer_size = DEFAULT_UDP_BUFFER_SIZE;
+    fb->jitter_buffer_ms = DEFAULT_JITTER_BUFFER_MS;
+    fb->max_queue_time_ms = DEFAULT_MAX_QUEUE_TIME_MS;
+
+    /* Output defaults */
+    fb->output_port = DEFAULT_OUTPUT_PORT;
+    fb->output_host = g_strdup(DEFAULT_OUTPUT_HOST);
+    fb->width = DEFAULT_WIDTH;
+    fb->height = DEFAULT_HEIGHT;
+    fb->fps = DEFAULT_FPS;
+    fb->bitrate = DEFAULT_BITRATE_KBPS;
+    fb->keyframe_interval = DEFAULT_KEYFRAME_INTERVAL;
+
+    /* Output mode */
     fb->raw_output = FALSE;
     fb->vp8_output = FALSE;
     fb->shm_output = FALSE;
-    fb->shm_path = g_strdup("/tmp/framebuffer.sock");
+
+    /* Shared memory */
+    fb->shm_path = g_strdup(DEFAULT_SHM_PATH);
+    fb->shm_size = DEFAULT_SHM_SIZE;
+
+    /* Appsink */
+    fb->appsink_max_buffers = DEFAULT_APPSINK_MAX_BUFFERS;
+
+    /* Stats */
+    fb->stats_interval = DEFAULT_STATS_INTERVAL_SEC;
+
+    /* Verbose */
+    fb->verbose = FALSE;
 
     return fb;
 }
 
-/**
- * Create input pipeline: UDP/MPEG-TS -> decode -> appsink
- * Built programmatically with manual pad-added handling for tsdemux
- * Now codec-agnostic using decodebin for automatic decoder selection
- */
+/* ========== Create Input Pipeline ========== */
 static gboolean create_input_pipeline(FrameBuffer *fb) {
     GError *error = NULL;
 
-    // Build pipeline with gst_parse_launch for simplicity
-    // Key fix: min-threshold-time=1000000000 (1 second buffer before playing)
-    // This smooths out UDP jitter that was causing choppy video
-    // Use decodebin3 for automatic codec detection (H.264, MPEG2, etc.)
+    /* Convert milliseconds to nanoseconds for GStreamer */
+    guint64 jitter_ns = fb->jitter_buffer_ms * 1000000ULL;
+    guint64 max_time_ns = fb->max_queue_time_ms * 1000000ULL;
+
+    /*
+     * Pipeline: UDP -> Jitter Buffer -> Demux -> Decode -> Normalize -> AppSink
+     *
+     * Key elements:
+     * - udpsrc: Receives UDP packets with large socket buffer
+     * - queue with min-threshold-time: JITTER BUFFER - waits before playing
+     * - tsparse: Parses MPEG-TS packets
+     * - decodebin3: Auto-selects decoder (H.264, MPEG-2, etc.)
+     * - videoconvert/videoscale: Normalizes to I420 at target resolution
+     * - appsink: Captures decoded frames
+     */
     gchar *pipeline_str = g_strdup_printf(
-        "udpsrc port=%d buffer-size=67108864 caps=\"video/mpegts,systemstream=true\" name=udpsrc "
-        "! queue min-threshold-time=1000000000 max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 "
+        "udpsrc port=%d buffer-size=%" G_GUINT64_FORMAT " "
+        "caps=\"video/mpegts,systemstream=true\" name=udpsrc "
+        "! queue min-threshold-time=%" G_GUINT64_FORMAT " "
+        "max-size-buffers=0 max-size-bytes=0 max-size-time=%" G_GUINT64_FORMAT " "
         "! tsparse "
         "! decodebin3 "
         "! videoconvert "
         "! videoscale "
         "! video/x-raw,format=I420,width=%d,height=%d "
-        "! appsink name=sink emit-signals=true sync=false max-buffers=2 drop=true",
-        fb->input_port, fb->width, fb->height
+        "! appsink name=sink emit-signals=true sync=false max-buffers=%d drop=true",
+        fb->input_port,
+        fb->udp_buffer_size,
+        jitter_ns,
+        max_time_ns,
+        fb->width,
+        fb->height,
+        fb->appsink_max_buffers
     );
 
-    g_print("[FrameBuffer] Creating input pipeline: %s\n", pipeline_str);
+    if (fb->verbose) {
+        g_print("[FrameBuffer] Input pipeline: %s\n", pipeline_str);
+    }
 
     fb->input_pipeline = gst_parse_launch(pipeline_str, &error);
     g_free(pipeline_str);
@@ -316,34 +236,28 @@ static gboolean create_input_pipeline(FrameBuffer *fb) {
         return FALSE;
     }
 
-    // Get appsink
+    /* Get appsink */
     fb->appsink = gst_bin_get_by_name(GST_BIN(fb->input_pipeline), "sink");
     if (!fb->appsink) {
         g_printerr("[FrameBuffer] Failed to get appsink\n");
         return FALSE;
     }
 
-    // Connect appsink signal
+    /* Connect appsink signal */
     g_signal_connect(fb->appsink, "new-sample", G_CALLBACK(on_new_sample), fb);
 
-    // Add bus watch for errors
+    /* Add bus watch for errors */
     GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(fb->input_pipeline));
     gst_bus_add_signal_watch(bus);
     g_signal_connect(bus, "message::error", G_CALLBACK(on_bus_error), (gpointer)"INPUT");
     gst_object_unref(bus);
 
-    g_print("[FrameBuffer] Input pipeline created (port %d, 1s buffer)\n", fb->input_port);
+    g_print("[FrameBuffer] Input: UDP port %d, %"G_GUINT64_FORMAT"ms jitter buffer\n",
+            fb->input_port, fb->jitter_buffer_ms);
     return TRUE;
 }
 
-/**
- * Create output pipeline: appsrc -> encode -> UDP or Shared Memory
- * Supports four modes:
- * - H.264 MPEG-TS (default): appsrc -> x264enc -> mpegtsmux -> udpsink
- * - Raw RTP (-r flag):       appsrc -> rtpvrawpay -> udpsink
- * - VP8 RTP (-v flag):       appsrc -> vp8enc -> rtpvp8pay -> udpsink
- * - Shared Memory (-s flag): appsrc -> shmsink (for WebRTC Gateway)
- */
+/* ========== Create Output Pipeline ========== */
 static gboolean create_output_pipeline(FrameBuffer *fb) {
     gchar *caps_str = g_strdup_printf(
         "video/x-raw,format=I420,width=%d,height=%d,framerate=%d/1",
@@ -354,30 +268,32 @@ static gboolean create_output_pipeline(FrameBuffer *fb) {
     const gchar *mode_name;
 
     if (fb->shm_output) {
-        // Shared Memory output - raw frames to shmsink for WebRTC Gateway
-        // This enables seamless source switching: FrameBuffer can restart
-        // without affecting the WebRTC connection
+        /* Shared Memory output for IPC with WebRTC Gateway */
         pipeline_str = g_strdup_printf(
             "appsrc name=src is-live=true format=time do-timestamp=true "
             "caps=\"%s\" "
-            "! shmsink socket-path=%s shm-size=20000000 wait-for-connection=false sync=false",
-            caps_str, fb->shm_path
+            "! shmsink socket-path=%s shm-size=%" G_GUINT64_FORMAT " "
+            "wait-for-connection=false sync=false",
+            caps_str, fb->shm_path, fb->shm_size
         );
         mode_name = "Shared Memory";
     } else if (fb->vp8_output) {
-        // VP8 RTP output - WebRTC-ready, single encode
+        /* VP8 RTP output - WebRTC-ready */
         pipeline_str = g_strdup_printf(
             "appsrc name=src is-live=true format=time do-timestamp=true "
             "caps=\"%s\" "
             "! videoconvert "
-            "! vp8enc deadline=1 cpu-used=4 target-bitrate=%d000 keyframe-max-dist=%d "
+            "! vp8enc deadline=%d cpu-used=%d target-bitrate=%d000 keyframe-max-dist=%d "
             "! rtpvp8pay mtu=1200 "
             "! udpsink host=%s port=%d sync=false",
-            caps_str, fb->bitrate, fb->fps, fb->output_host, fb->output_port
+            caps_str,
+            DEFAULT_VP8_DEADLINE, DEFAULT_VP8_CPU_USED,
+            fb->bitrate, fb->keyframe_interval,
+            fb->output_host, fb->output_port
         );
         mode_name = "VP8 RTP";
     } else if (fb->raw_output) {
-        // Raw RTP output - no encoding, minimal latency
+        /* Raw RTP output - no encoding */
         pipeline_str = g_strdup_printf(
             "appsrc name=src is-live=true format=time do-timestamp=true "
             "caps=\"%s\" "
@@ -385,23 +301,30 @@ static gboolean create_output_pipeline(FrameBuffer *fb) {
             "! udpsink host=%s port=%d sync=false",
             caps_str, fb->output_host, fb->output_port
         );
-        mode_name = "RAW RTP";
+        mode_name = "Raw RTP";
     } else {
-        // H.264 MPEG-TS output (default)
+        /* H.264 MPEG-TS output (default) */
         pipeline_str = g_strdup_printf(
             "appsrc name=src is-live=true format=time do-timestamp=false "
             "caps=\"%s\" "
             "! videoconvert "
-            "! x264enc tune=zerolatency speed-preset=ultrafast bitrate=%d key-int-max=%d "
+            "! x264enc tune=%s speed-preset=%s bitrate=%d key-int-max=%d "
             "! h264parse "
             "! mpegtsmux "
             "! udpsink host=%s port=%d sync=false",
-            caps_str, fb->bitrate, fb->fps, fb->output_host, fb->output_port
+            caps_str,
+            DEFAULT_X264_TUNE, DEFAULT_X264_PRESET,
+            fb->bitrate, fb->keyframe_interval,
+            fb->output_host, fb->output_port
         );
         mode_name = "H.264 MPEG-TS";
     }
 
     g_free(caps_str);
+
+    if (fb->verbose) {
+        g_print("[FrameBuffer] Output pipeline: %s\n", pipeline_str);
+    }
 
     GError *error = NULL;
     fb->output_pipeline = gst_parse_launch(pipeline_str, &error);
@@ -413,19 +336,22 @@ static gboolean create_output_pipeline(FrameBuffer *fb) {
         return FALSE;
     }
 
-    // Get appsrc
+    /* Get appsrc */
     fb->appsrc = gst_bin_get_by_name(GST_BIN(fb->output_pipeline), "src");
 
-    g_print("[FrameBuffer] Output pipeline created (%s:%d @ %dfps, %s)\n",
-            fb->output_host, fb->output_port, fb->fps, mode_name);
+    if (fb->shm_output) {
+        g_print("[FrameBuffer] Output: %s @ %s, %dx%d @ %dfps\n",
+                mode_name, fb->shm_path, fb->width, fb->height, fb->fps);
+    } else {
+        g_print("[FrameBuffer] Output: %s @ %s:%d, %dx%d @ %dfps, %dkbps\n",
+                mode_name, fb->output_host, fb->output_port,
+                fb->width, fb->height, fb->fps, fb->bitrate);
+    }
+
     return TRUE;
 }
 
-/**
- * Called when a new frame arrives from input
- * Accept all frames - the render loop imposes proper timing on output
- * Note: CORRUPTED flag is unreliable, so we don't filter on it
- */
+/* ========== New Sample Callback ========== */
 static GstFlowReturn on_new_sample(GstElement *sink, FrameBuffer *fb) {
     GstSample *sample = gst_app_sink_pull_sample(GST_APP_SINK(sink));
     if (!sample) return GST_FLOW_ERROR;
@@ -435,20 +361,20 @@ static GstFlowReturn on_new_sample(GstElement *sink, FrameBuffer *fb) {
 
     g_mutex_lock(&fb->frame_mutex);
 
-    // Replace current frame
+    /* Replace current frame */
     if (fb->current_frame) {
         gst_buffer_unref(fb->current_frame);
     }
     fb->current_frame = gst_buffer_ref(buffer);
 
-    // Update caps if changed
+    /* Update caps if changed */
     if (caps && (!fb->current_caps || !gst_caps_is_equal(caps, fb->current_caps))) {
         if (fb->current_caps) gst_caps_unref(fb->current_caps);
         fb->current_caps = gst_caps_ref(caps);
     }
 
     fb->frames_in++;
-    fb->in_seq++;  // Increment sequence for repeat detection
+    fb->in_seq++;
 
     g_mutex_unlock(&fb->frame_mutex);
 
@@ -457,23 +383,21 @@ static GstFlowReturn on_new_sample(GstElement *sink, FrameBuffer *fb) {
     return GST_FLOW_OK;
 }
 
-/**
- * Create a simple fallback frame (gray with "NO SIGNAL" concept)
- */
+/* ========== Create Fallback Frame ========== */
 static GstBuffer *create_fallback_frame(FrameBuffer *fb) {
     gsize y_size = fb->width * fb->height;
     gsize uv_size = y_size / 4;
-    gsize total_size = y_size + 2 * uv_size;  // I420 format
+    gsize total_size = y_size + 2 * uv_size;  /* I420 format */
 
     GstBuffer *buffer = gst_buffer_new_allocate(NULL, total_size, NULL);
 
     GstMapInfo map;
     gst_buffer_map(buffer, &map, GST_MAP_WRITE);
 
-    // Y plane: gray (128)
+    /* Y plane: gray (128) */
     memset(map.data, 128, y_size);
 
-    // U and V planes: neutral (128)
+    /* U and V planes: neutral (128) */
     memset(map.data + y_size, 128, uv_size);
     memset(map.data + y_size + uv_size, 128, uv_size);
 
@@ -482,17 +406,14 @@ static GstBuffer *create_fallback_frame(FrameBuffer *fb) {
     return buffer;
 }
 
-/**
- * Render loop - runs at exactly fb->fps using GStreamer clock
- * This is the heart of the frame synchronizer
- */
+/* ========== Render Loop ========== */
 static gpointer render_loop(gpointer data) {
     FrameBuffer *fb = (FrameBuffer *)data;
 
-    // Compute frame duration from configured fps
+    /* Compute frame duration from configured fps */
     GstClockTime frame_duration = gst_util_uint64_scale_int(GST_SECOND, 1, fb->fps);
 
-    g_print("[FrameBuffer] Render loop started (%d fps, frame=%"G_GUINT64_FORMAT"ns)\n",
+    g_print("[FrameBuffer] Render loop started (%d fps, frame=%" G_GUINT64_FORMAT "ns)\n",
             fb->fps, frame_duration);
 
     GstClock *clock = gst_pipeline_get_clock(GST_PIPELINE(fb->output_pipeline));
@@ -501,18 +422,16 @@ static gpointer render_loop(gpointer data) {
         return NULL;
     }
 
-    // Use element base-time for proper scheduling
-    GstClockTime base_time = gst_element_get_base_time(
-        GST_ELEMENT(fb->output_pipeline));
-
+    GstClockTime base_time = gst_element_get_base_time(GST_ELEMENT(fb->output_pipeline));
     guint64 frame_count = 0;
+    guint64 stats_frames = fb->fps * fb->stats_interval;
 
     while (fb->running) {
         GstBuffer *buffer_to_push = NULL;
         gboolean is_repeat = FALSE;
         guint64 current_seq = 0;
 
-        // Get current frame (or create fallback)
+        /* Get current frame (or create fallback) */
         g_mutex_lock(&fb->frame_mutex);
 
         if (fb->current_frame) {
@@ -525,19 +444,19 @@ static gpointer render_loop(gpointer data) {
 
         g_mutex_unlock(&fb->frame_mutex);
 
-        // Detect actual frame repeat (same input frame pushed multiple times)
+        /* Detect frame repeat */
         if (!is_repeat && current_seq == fb->last_pushed_seq) {
-            is_repeat = TRUE;  // Same frame as last time
+            is_repeat = TRUE;
         }
         fb->last_pushed_seq = current_seq;
 
-        // Set timestamps - render loop imposes proper timing
+        /* Set timestamps */
         GstClockTime pts = frame_count * frame_duration;
         GST_BUFFER_PTS(buffer_to_push) = pts;
         GST_BUFFER_DTS(buffer_to_push) = pts;
         GST_BUFFER_DURATION(buffer_to_push) = frame_duration;
 
-        // Push to output
+        /* Push to output */
         GstFlowReturn ret = gst_app_src_push_buffer(
             GST_APP_SRC(fb->appsrc), buffer_to_push);
 
@@ -549,15 +468,15 @@ static gpointer render_loop(gpointer data) {
         if (is_repeat) fb->frames_repeated++;
         frame_count++;
 
-        // Stats every 5 seconds
-        if ((frame_count % (fb->fps * 5)) == 0) {
+        /* Stats */
+        if (stats_frames > 0 && (frame_count % stats_frames) == 0) {
             g_print("[FrameBuffer] Stats: in=%" G_GUINT64_FORMAT
                     " out=%" G_GUINT64_FORMAT
                     " repeated=%" G_GUINT64_FORMAT "\n",
                     fb->frames_in, fb->frames_out, fb->frames_repeated);
         }
 
-        // Wait until next frame time using GstClockID (proper GStreamer timing)
+        /* Wait until next frame time */
         GstClockTime running_time = frame_count * frame_duration;
         GstClockTime target_time = base_time + running_time;
         GstClockID clk_id = gst_clock_new_single_shot_id(clock, target_time);
@@ -571,53 +490,35 @@ static gpointer render_loop(gpointer data) {
     return NULL;
 }
 
-/**
- * Idle callback to start pipelines after main loop is running
- */
+/* ========== Pipeline Start (Idle Callback) ========== */
 static gboolean start_pipelines_idle(gpointer data) {
     FrameBuffer *fb = (FrameBuffer *)data;
 
     g_print("[FrameBuffer] Starting pipelines...\n");
 
-    // Start output pipeline first
+    /* Start output pipeline first */
     gst_element_set_state(fb->output_pipeline, GST_STATE_PLAYING);
 
-    // Start render loop
+    /* Start render loop */
     fb->running = TRUE;
     fb->render_thread = g_thread_new("render-loop", render_loop, fb);
 
-    // Start input pipeline
+    /* Start input pipeline */
     gst_element_set_state(fb->input_pipeline, GST_STATE_PLAYING);
 
     g_print("[FrameBuffer] Running\n");
-    g_print("[FrameBuffer] Input:  UDP port %d\n", fb->input_port);
-    if (fb->shm_output) {
-        g_print("[FrameBuffer] Output: Shared Memory %s @ %dfps\n",
-                fb->shm_path, fb->fps);
-    } else {
-        g_print("[FrameBuffer] Output: %s:%d @ %dfps\n",
-                fb->output_host, fb->output_port, fb->fps);
-    }
 
-    return G_SOURCE_REMOVE;  // Don't call again
+    return G_SOURCE_REMOVE;
 }
 
-/**
- * Start the frame buffer - schedules pipeline start via main loop
- */
+/* ========== Start ========== */
 static gboolean framebuffer_start(FrameBuffer *fb) {
     g_print("[FrameBuffer] Scheduling startup...\n");
-
-    // Schedule pipeline start to run after main loop starts
-    // This ensures dynamic pad callbacks can be processed
     g_idle_add(start_pipelines_idle, fb);
-
     return TRUE;
 }
 
-/**
- * Stop the frame buffer
- */
+/* ========== Stop ========== */
 static void framebuffer_stop(FrameBuffer *fb) {
     g_print("[FrameBuffer] Stopping...\n");
 
@@ -634,13 +535,10 @@ static void framebuffer_stop(FrameBuffer *fb) {
     g_print("[FrameBuffer] Stopped\n");
 }
 
-/**
- * Cleanup
- */
+/* ========== Cleanup ========== */
 static void framebuffer_free(FrameBuffer *fb) {
     if (fb->current_frame) gst_buffer_unref(fb->current_frame);
     if (fb->current_caps) gst_caps_unref(fb->current_caps);
-    // Pipeline unrefs take care of child elements (appsink, appsrc)
     if (fb->input_pipeline) gst_object_unref(fb->input_pipeline);
     if (fb->output_pipeline) gst_object_unref(fb->output_pipeline);
     g_free(fb->output_host);
@@ -649,9 +547,7 @@ static void framebuffer_free(FrameBuffer *fb) {
     g_free(fb);
 }
 
-/**
- * Signal handler for clean shutdown
- */
+/* ========== Signal Handler ========== */
 static FrameBuffer *g_fb = NULL;
 
 static void signal_handler(int sig) {
@@ -661,77 +557,166 @@ static void signal_handler(int sig) {
     }
 }
 
-/**
- * Print usage
- */
+/* ========== Help / Usage ========== */
 static void print_usage(const char *prog) {
-    g_print("Usage: %s [options]\n", prog);
-    g_print("Options:\n");
-    g_print("  -i PORT   Input UDP port (default: 5001)\n");
-    g_print("  -o PORT   Output UDP port (default: 5002)\n");
-    g_print("  -H HOST   Output host (default: 127.0.0.1)\n");
-    g_print("  -w WIDTH  Output width (default: 640)\n");
-    g_print("  -h HEIGHT Output height (default: 480)\n");
-    g_print("  -f FPS    Output framerate (default: 25)\n");
-    g_print("  -b KBPS   Output bitrate in kbps (default: 2000)\n");
-    g_print("  -r        Raw RTP output (no encoding)\n");
-    g_print("  -v        VP8 RTP output (WebRTC-ready)\n");
-    g_print("  -s [PATH] Shared memory output for WebRTC Gateway\n");
-    g_print("            (default path: /tmp/framebuffer.sock)\n");
+    g_print("SoftwareFrameBuffer v%s - Ultra-stable video frame synchronizer\n\n", VERSION);
+    g_print("Usage: %s [options]\n\n", prog);
+
+    g_print("INPUT OPTIONS:\n");
+    g_print("  -i, --input-port PORT      UDP input port (default: %d)\n", DEFAULT_INPUT_PORT);
+    g_print("  -B, --udp-buffer SIZE      UDP socket buffer in bytes (default: %d)\n", DEFAULT_UDP_BUFFER_SIZE);
+    g_print("  -j, --jitter-buffer MS     Jitter buffer in milliseconds (default: %d)\n", DEFAULT_JITTER_BUFFER_MS);
+    g_print("  -Q, --max-queue MS         Max queue time in milliseconds (default: %d)\n", DEFAULT_MAX_QUEUE_TIME_MS);
+    g_print("\n");
+
+    g_print("OUTPUT OPTIONS:\n");
+    g_print("  -o, --output-port PORT     UDP output port (default: %d)\n", DEFAULT_OUTPUT_PORT);
+    g_print("  -H, --host HOST            Output host/IP (default: %s)\n", DEFAULT_OUTPUT_HOST);
+    g_print("  -w, --width WIDTH          Output width (default: %d)\n", DEFAULT_WIDTH);
+    g_print("  -h, --height HEIGHT        Output height (default: %d)\n", DEFAULT_HEIGHT);
+    g_print("  -f, --fps FPS              Output framerate (default: %d)\n", DEFAULT_FPS);
+    g_print("  -b, --bitrate KBPS         Encoder bitrate in kbps (default: %d)\n", DEFAULT_BITRATE_KBPS);
+    g_print("  -k, --keyframe INT         Keyframe interval / GOP size (default: %d)\n", DEFAULT_KEYFRAME_INTERVAL);
+    g_print("\n");
+
+    g_print("OUTPUT MODES (mutually exclusive):\n");
+    g_print("  (default)                  H.264 MPEG-TS over UDP\n");
+    g_print("  -r, --raw                  Raw RTP video (no encoding)\n");
+    g_print("  -v, --vp8                  VP8 RTP (WebRTC-ready)\n");
+    g_print("  -s, --shm [PATH]           Shared memory output (default: %s)\n", DEFAULT_SHM_PATH);
+    g_print("      --shm-size SIZE        Shared memory size in bytes (default: %d)\n", DEFAULT_SHM_SIZE);
+    g_print("\n");
+
+    g_print("OTHER OPTIONS:\n");
+    g_print("  -S, --stats-interval SEC   Stats print interval, 0=off (default: %d)\n", DEFAULT_STATS_INTERVAL_SEC);
+    g_print("  -V, --verbose              Verbose output (show pipeline strings)\n");
+    g_print("      --help                 Show this help\n");
+    g_print("      --version              Show version\n");
+    g_print("\n");
+
+    g_print("EXAMPLES:\n");
+    g_print("  %s -i 5000 -w 1280 -h 720 -f 30\n", prog);
+    g_print("  %s -i 5000 -s /tmp/fb.sock -w 640 -h 480 -f 30\n", prog);
+    g_print("  %s -i 5000 -v -o 5004 -b 3000\n", prog);
+    g_print("  %s -i 5000 -j 2000 --verbose\n", prog);
 }
 
-/**
- * Main
- */
+static void print_version(void) {
+    g_print("SoftwareFrameBuffer v%s\n", VERSION);
+}
+
+/* ========== Main ========== */
 int main(int argc, char *argv[]) {
     gst_init(&argc, &argv);
 
     FrameBuffer *fb = framebuffer_new();
     g_fb = fb;
 
-    // Parse arguments
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
-            fb->input_port = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
-            fb->output_port = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-H") == 0 && i + 1 < argc) {
-            g_free(fb->output_host);
-            fb->output_host = g_strdup(argv[++i]);
-        } else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
-            fb->width = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-h") == 0 && i + 1 < argc) {
-            fb->height = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
-            fb->fps = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
-            fb->bitrate = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-r") == 0) {
-            fb->raw_output = TRUE;
-        } else if (strcmp(argv[i], "-v") == 0) {
-            fb->vp8_output = TRUE;
-        } else if (strcmp(argv[i], "-s") == 0) {
-            fb->shm_output = TRUE;
-            // Optional path argument
-            if (i + 1 < argc && argv[i + 1][0] != '-') {
-                g_free(fb->shm_path);
-                fb->shm_path = g_strdup(argv[++i]);
-            }
-        } else if (strcmp(argv[i], "--help") == 0) {
-            print_usage(argv[0]);
-            return 0;
+    /* Long options */
+    static struct option long_options[] = {
+        {"input-port",    required_argument, 0, 'i'},
+        {"udp-buffer",    required_argument, 0, 'B'},
+        {"jitter-buffer", required_argument, 0, 'j'},
+        {"max-queue",     required_argument, 0, 'Q'},
+        {"output-port",   required_argument, 0, 'o'},
+        {"host",          required_argument, 0, 'H'},
+        {"width",         required_argument, 0, 'w'},
+        {"height",        required_argument, 0, 'h'},
+        {"fps",           required_argument, 0, 'f'},
+        {"bitrate",       required_argument, 0, 'b'},
+        {"keyframe",      required_argument, 0, 'k'},
+        {"raw",           no_argument,       0, 'r'},
+        {"vp8",           no_argument,       0, 'v'},
+        {"shm",           optional_argument, 0, 's'},
+        {"shm-size",      required_argument, 0, 'Z'},
+        {"stats-interval",required_argument, 0, 'S'},
+        {"verbose",       no_argument,       0, 'V'},
+        {"help",          no_argument,       0, '?'},
+        {"version",       no_argument,       0, 'E'},
+        {0, 0, 0, 0}
+    };
+
+    int opt;
+    int option_index = 0;
+
+    while ((opt = getopt_long(argc, argv, "i:B:j:Q:o:H:w:h:f:b:k:rvs::Z:S:V",
+                              long_options, &option_index)) != -1) {
+        switch (opt) {
+            case 'i':
+                fb->input_port = atoi(optarg);
+                break;
+            case 'B':
+                fb->udp_buffer_size = strtoull(optarg, NULL, 10);
+                break;
+            case 'j':
+                fb->jitter_buffer_ms = strtoull(optarg, NULL, 10);
+                break;
+            case 'Q':
+                fb->max_queue_time_ms = strtoull(optarg, NULL, 10);
+                break;
+            case 'o':
+                fb->output_port = atoi(optarg);
+                break;
+            case 'H':
+                g_free(fb->output_host);
+                fb->output_host = g_strdup(optarg);
+                break;
+            case 'w':
+                fb->width = atoi(optarg);
+                break;
+            case 'h':
+                fb->height = atoi(optarg);
+                break;
+            case 'f':
+                fb->fps = atoi(optarg);
+                break;
+            case 'b':
+                fb->bitrate = atoi(optarg);
+                break;
+            case 'k':
+                fb->keyframe_interval = atoi(optarg);
+                break;
+            case 'r':
+                fb->raw_output = TRUE;
+                break;
+            case 'v':
+                fb->vp8_output = TRUE;
+                break;
+            case 's':
+                fb->shm_output = TRUE;
+                if (optarg) {
+                    g_free(fb->shm_path);
+                    fb->shm_path = g_strdup(optarg);
+                }
+                break;
+            case 'Z':
+                fb->shm_size = strtoull(optarg, NULL, 10);
+                break;
+            case 'S':
+                fb->stats_interval = atoi(optarg);
+                break;
+            case 'V':
+                fb->verbose = TRUE;
+                break;
+            case 'E':
+                print_version();
+                return 0;
+            case '?':
+            default:
+                print_usage(argv[0]);
+                return (opt == '?') ? 0 : 1;
         }
     }
 
     g_print("========================================\n");
-    g_print("FrameBuffer v1.0 - Video Frame Synchronizer\n");
+    g_print("SoftwareFrameBuffer v%s\n", VERSION);
     g_print("========================================\n");
 
-    // Setup signal handlers
+    /* Setup signal handlers */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    // Create pipelines
+    /* Create pipelines */
     if (!create_input_pipeline(fb)) {
         g_printerr("Failed to create input pipeline\n");
         return 1;
@@ -742,19 +727,19 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Create main loop first - needed for dynamic pad callbacks
+    /* Create main loop */
     fb->loop = g_main_loop_new(NULL, FALSE);
 
-    // Schedule startup (will run when main loop starts)
+    /* Schedule startup */
     if (!framebuffer_start(fb)) {
         g_printerr("Failed to schedule frame buffer start\n");
         return 1;
     }
 
-    // Run main loop - pipelines start via idle callback
+    /* Run main loop */
     g_main_loop_run(fb->loop);
 
-    // Cleanup
+    /* Cleanup */
     framebuffer_stop(fb);
     g_main_loop_unref(fb->loop);
     framebuffer_free(fb);
