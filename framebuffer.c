@@ -199,7 +199,7 @@ static OutputContainer string_to_container(const char *str) {
     return CONTAINER_RTP;  /* Default */
 }
 
-/* ========== Bus Error Handler ========== */
+/* ========== Bus Message Handlers ========== */
 static void on_bus_error(GstBus *bus, GstMessage *msg, gpointer data) {
     (void)bus;
     const char *pipeline_name = (const char *)data;
@@ -213,6 +213,25 @@ static void on_bus_error(GstBus *bus, GstMessage *msg, gpointer data) {
     }
     g_error_free(err);
     g_free(debug);
+}
+
+static void on_bus_warning(GstBus *bus, GstMessage *msg, gpointer data) {
+    (void)bus;
+    const char *pipeline_name = (const char *)data;
+    GError *err = NULL;
+    gchar *debug = NULL;
+
+    gst_message_parse_warning(msg, &err, &debug);
+    g_print("[FrameBuffer] %s WARNING: %s\n", pipeline_name, err->message);
+    g_error_free(err);
+    g_free(debug);
+}
+
+static void on_bus_eos(GstBus *bus, GstMessage *msg, gpointer data) {
+    (void)bus;
+    (void)msg;
+    const char *pipeline_name = (const char *)data;
+    g_print("[FrameBuffer] %s: End of stream\n", pipeline_name);
 }
 
 /* ========== Initialize FrameBuffer with Defaults ========== */
@@ -311,6 +330,8 @@ static gboolean create_input_pipeline(FrameBuffer *fb) {
     GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(fb->input_pipeline));
     gst_bus_add_signal_watch(bus);
     g_signal_connect(bus, "message::error", G_CALLBACK(on_bus_error), (gpointer)"INPUT");
+    g_signal_connect(bus, "message::warning", G_CALLBACK(on_bus_warning), (gpointer)"INPUT");
+    g_signal_connect(bus, "message::eos", G_CALLBACK(on_bus_eos), (gpointer)"INPUT");
     gst_object_unref(bus);
 
     g_print("[FrameBuffer] Input: UDP port %d, %" G_GUINT64_FORMAT "ms jitter buffer\n",
@@ -504,6 +525,14 @@ static gboolean create_output_pipeline(FrameBuffer *fb) {
 
     fb->appsrc = gst_bin_get_by_name(GST_BIN(fb->output_pipeline), "src");
 
+    /* Add bus watchers for output pipeline */
+    GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(fb->output_pipeline));
+    gst_bus_add_signal_watch(bus);
+    g_signal_connect(bus, "message::error", G_CALLBACK(on_bus_error), (gpointer)"OUTPUT");
+    g_signal_connect(bus, "message::warning", G_CALLBACK(on_bus_warning), (gpointer)"OUTPUT");
+    g_signal_connect(bus, "message::eos", G_CALLBACK(on_bus_eos), (gpointer)"OUTPUT");
+    gst_object_unref(bus);
+
     /* Print output info */
     if (fb->container == CONTAINER_SHM) {
         g_print("[FrameBuffer] Output: %s/%s @ %s, %dx%d @ %dfps\n",
@@ -548,7 +577,13 @@ static GstFlowReturn on_new_sample(GstElement *sink, FrameBuffer *fb) {
     fb->current_frame = gst_buffer_ref(buffer);
 
     if (caps && (!fb->current_caps || !gst_caps_is_equal(caps, fb->current_caps))) {
-        if (fb->current_caps) gst_caps_unref(fb->current_caps);
+        if (fb->current_caps) {
+            gst_caps_unref(fb->current_caps);
+            /* Log caps change for debugging (input scaled to output size by videoscale) */
+            gchar *caps_str = gst_caps_to_string(caps);
+            g_print("[FrameBuffer] Input caps changed: %s\n", caps_str);
+            g_free(caps_str);
+        }
         fb->current_caps = gst_caps_ref(caps);
     }
 
