@@ -16,7 +16,11 @@
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <stdio.h>
+#include <stdlib.h>   /* For atoi, strtoull */
 #include <string.h>
+#include <strings.h>  /* For strcasecmp (POSIX) */
+#include <unistd.h>   /* For standard POSIX definitions */
+#include <signal.h>   /* For signal, SIGINT */
 #include <getopt.h>
 
 /* ========== Version ========== */
@@ -271,7 +275,7 @@ static gboolean create_input_pipeline(FrameBuffer *fb) {
         "! tsparse "
         "! decodebin3 "
         "! videoconvert "
-        "! videoscale "
+        "! videoscale add-borders=true "
         "! video/x-raw,format=I420,width=%d,height=%d "
         "! appsink name=sink emit-signals=true sync=false max-buffers=%d drop=true",
         fb->input_port,
@@ -451,7 +455,7 @@ static gboolean create_output_pipeline(FrameBuffer *fb) {
      * Always use do-timestamp=false because render_loop calculates precise PTS.
      * If do-timestamp=true, appsrc would overwrite our carefully calculated timestamps.
      */
-    const char *appsrc_props = "appsrc name=src is-live=true format=time do-timestamp=false";
+    const char *appsrc_props = "appsrc name=src is-live=true format=time do-timestamp=false min-latency=0";
 
     gchar *pipeline_str;
     if (fb->container == CONTAINER_SHM && fb->codec == CODEC_RAW) {
@@ -583,10 +587,7 @@ static GstBuffer *create_fallback_frame(FrameBuffer *fb) {
 static gpointer render_loop(gpointer data) {
     FrameBuffer *fb = (FrameBuffer *)data;
 
-    GstClockTime frame_duration = gst_util_uint64_scale_int(GST_SECOND, 1, fb->fps);
-
-    g_print("[FrameBuffer] Render loop started (%d fps, frame=%" G_GUINT64_FORMAT "ns)\n",
-            fb->fps, frame_duration);
+    g_print("[FrameBuffer] Render loop started (%d fps)\n", fb->fps);
 
     GstClock *clock = gst_pipeline_get_clock(GST_PIPELINE(fb->output_pipeline));
     if (!clock) {
@@ -604,6 +605,16 @@ static gpointer render_loop(gpointer data) {
         gboolean is_repeat = FALSE;
         gboolean use_fallback = FALSE;
         guint64 current_seq = 0;
+
+        /*
+         * DRIFT-FREE TIMING (intern review fix):
+         * Use gst_util_uint64_scale_int instead of frame_count * duration.
+         * This prevents integer rounding errors from accumulating over weeks/months.
+         * Formula: (frame_count * GST_SECOND) / fps - calculated exactly each time.
+         */
+        GstClockTime pts = gst_util_uint64_scale_int(frame_count, GST_SECOND, fb->fps);
+        GstClockTime next_pts = gst_util_uint64_scale_int(frame_count + 1, GST_SECOND, fb->fps);
+        GstClockTime duration = next_pts - pts;
 
         g_mutex_lock(&fb->frame_mutex);
 
@@ -644,10 +655,10 @@ static gpointer render_loop(gpointer data) {
         }
         fb->last_pushed_seq = current_seq;
 
-        GstClockTime pts = frame_count * frame_duration;
+        /* Apply timestamps (do-timestamp=false on appsrc, we are clock master) */
         GST_BUFFER_PTS(buffer_to_push) = pts;
         GST_BUFFER_DTS(buffer_to_push) = pts;
-        GST_BUFFER_DURATION(buffer_to_push) = frame_duration;
+        GST_BUFFER_DURATION(buffer_to_push) = duration;
 
         GstFlowReturn ret = gst_app_src_push_buffer(
             GST_APP_SRC(fb->appsrc), buffer_to_push);
@@ -657,7 +668,7 @@ static gpointer render_loop(gpointer data) {
                 g_print("[FrameBuffer] Output pipeline flushing/EOS, stopping loop\n");
                 break;
             }
-            g_printerr("[FrameBuffer] Push error: %d\n", ret);
+            /* Ignore other errors to keep loop alive */
         }
 
         fb->frames_out++;
@@ -671,8 +682,9 @@ static gpointer render_loop(gpointer data) {
                     fb->frames_in, fb->frames_out, fb->frames_repeated);
         }
 
-        GstClockTime running_time = frame_count * frame_duration;
-        GstClockTime target_time = base_time + running_time;
+        /* Wait for next frame using same drift-free calculation */
+        GstClockTime target_running_time = gst_util_uint64_scale_int(frame_count, GST_SECOND, fb->fps);
+        GstClockTime target_time = base_time + target_running_time;
         GstClockID clk_id = gst_clock_new_single_shot_id(clock, target_time);
         gst_clock_id_wait(clk_id, NULL);
         gst_clock_id_unref(clk_id);
