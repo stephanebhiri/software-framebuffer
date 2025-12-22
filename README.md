@@ -84,25 +84,33 @@ make
 ```
 ./framebuffer [options]
 
-Input options:
-  -i PORT     UDP input port (default: 5001)
+INPUT OPTIONS:
+  -i, --input-port PORT      UDP input port (default: 5001)
+  -B, --udp-buffer SIZE      UDP socket buffer in bytes (default: 67108864)
+  -j, --jitter-buffer MS     Jitter buffer in milliseconds (default: 1000)
+  -Q, --max-queue MS         Max queue time in milliseconds (default: 5000)
 
-Output options:
-  -o PORT     UDP output port (default: 5002)
-  -H HOST     Output host/IP (default: 127.0.0.1)
-  -w WIDTH    Output width (default: 640)
-  -h HEIGHT   Output height (default: 480)
-  -f FPS      Output framerate (default: 25)
-  -b KBPS     Encoder bitrate in kbps (default: 2000)
+OUTPUT OPTIONS:
+  -o, --output-port PORT     UDP output port (default: 5002)
+  -H, --host HOST            Output host/IP (default: 127.0.0.1)
+  -w, --width WIDTH          Output width (default: 640)
+  -h, --height HEIGHT        Output height (default: 480)
+  -f, --fps FPS              Output framerate (default: 25)
+  -b, --bitrate KBPS         Encoder bitrate in kbps (default: 2000)
+  -k, --keyframe INT         Keyframe interval / GOP size (default: 30)
 
-Output modes:
-  (default)   H.264 MPEG-TS over UDP
-  -r          Raw RTP video (no encoding)
-  -v          VP8 RTP (WebRTC-ready)
-  -s [PATH]   Shared memory output (default: /tmp/framebuffer.sock)
+OUTPUT MODES (mutually exclusive):
+  (default)                  H.264 MPEG-TS over UDP
+  -r, --raw                  Raw RTP video (no encoding)
+  -v, --vp8                  VP8 RTP (WebRTC-ready)
+  -s, --shm [PATH]           Shared memory output (default: /tmp/framebuffer.sock)
+      --shm-size SIZE        Shared memory size in bytes (default: 20000000)
 
-Other options:
-  --help      Show this help
+OTHER OPTIONS:
+  -S, --stats-interval SEC   Stats print interval, 0=off (default: 5)
+  -V, --verbose              Verbose output (show pipeline strings)
+      --help                 Show this help
+      --version              Show version
 ```
 
 ---
@@ -130,6 +138,11 @@ Other options:
 ./framebuffer -i 5000 -w 1280 -h 720 -f 30 -b 4000
 ```
 
+### Custom jitter buffer (2 seconds):
+```bash
+./framebuffer -i 5000 -j 2000 --verbose
+```
+
 ### Shared memory for WebRTC Gateway:
 ```bash
 ./framebuffer -i 5000 -s /tmp/framebuffer.sock -w 640 -h 480 -f 30
@@ -137,7 +150,12 @@ Other options:
 
 ### VP8 RTP for direct WebRTC:
 ```bash
-./framebuffer -i 5000 -v -o 5004
+./framebuffer -i 5000 -v -o 5004 -b 3000
+```
+
+### Disable stats output:
+```bash
+./framebuffer -i 5000 -S 0
 ```
 
 ---
