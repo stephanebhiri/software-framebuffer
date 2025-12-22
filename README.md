@@ -101,7 +101,8 @@ OUTPUT OPTIONS:
 
 OUTPUT FORMAT:
   -c, --codec CODEC          Output codec: raw, h264, h265, vp8, vp9 (default: h264)
-  -C, --container CONT       Container: rtp, mpegts, shm, raw (default: mpegts)
+  -C, --container CONT       Container: rtp, mpegts, shm, raw, file (default: mpegts)
+  -F, --file PATH            Output file path (auto-sets container to file)
 
 SHARED MEMORY OPTIONS (when -C shm):
   -p, --shm-path PATH        Shared memory socket path (default: /tmp/framebuffer.sock)
@@ -136,6 +137,7 @@ OTHER OPTIONS:
 | `rtp` | RTP payload over UDP | SDP-based players, WebRTC |
 | `shm` | Shared memory (shmsink) | IPC with other processes |
 | `raw` | Raw UDP (no container) | Direct consumption |
+| `file` | File output (MP4/MKV/AVI) | Recording, archiving |
 
 ### Recommended Combinations
 
@@ -143,8 +145,10 @@ OTHER OPTIONS:
 |-------------------|---------|----------|
 | h264/mpegts | `-c h264 -C mpegts` | Standard broadcast (default) |
 | h264/rtp | `-c h264 -C rtp` | SDP-based streaming |
+| h264/file | `-F output.mp4` | Recording to MP4 |
 | h265/mpegts | `-c h265 -C mpegts` | High efficiency broadcast |
 | vp8/rtp | `-c vp8 -C rtp` | WebRTC direct input |
+| vp8/file | `-c vp8 -F output.mkv` | Recording VP8 to MKV |
 | vp9/rtp | `-c vp9 -C rtp` | Modern WebRTC |
 | raw/shm | `-c raw -C shm` | IPC with WebRTC Gateway |
 
@@ -180,6 +184,16 @@ OTHER OPTIONS:
 ### H.264 RTP for SDP-based players:
 ```bash
 ./framebuffer -i 5000 -c h264 -C rtp -o 5004
+```
+
+### Record to MP4 file:
+```bash
+./framebuffer -i 5000 -F output.mp4
+```
+
+### Record VP9 to MKV:
+```bash
+./framebuffer -i 5000 -c vp9 -F output.mkv
 ```
 
 ### Custom jitter buffer (2 seconds):
