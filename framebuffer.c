@@ -74,7 +74,8 @@ typedef enum {
     CONTAINER_RTP,      /* RTP payload over UDP */
     CONTAINER_MPEGTS,   /* MPEG-TS over UDP */
     CONTAINER_SHM,      /* Shared memory (raw frames) */
-    CONTAINER_RAW_UDP   /* Raw bitstream over UDP (no container) */
+    CONTAINER_RAW_UDP,  /* Raw bitstream over UDP (no container) */
+    CONTAINER_FILE      /* File output (mp4, mkv, ts) */
 } OutputContainer;
 
 /* ========== Data Structures ========== */
@@ -127,6 +128,9 @@ typedef struct {
     gchar *shm_path;
     guint64 shm_size;
 
+    /* File output config */
+    gchar *output_file;
+
     /* Appsink config */
     gint appsink_max_buffers;
 
@@ -164,6 +168,7 @@ static const char *container_to_string(OutputContainer container) {
         case CONTAINER_MPEGTS:  return "mpegts";
         case CONTAINER_SHM:     return "shm";
         case CONTAINER_RAW_UDP: return "raw";
+        case CONTAINER_FILE:    return "file";
         default:                return "unknown";
     }
 }
@@ -182,6 +187,8 @@ static OutputContainer string_to_container(const char *str) {
     if (strcasecmp(str, "mpegts") == 0 || strcasecmp(str, "ts") == 0) return CONTAINER_MPEGTS;
     if (strcasecmp(str, "shm") == 0 || strcasecmp(str, "shmem") == 0) return CONTAINER_SHM;
     if (strcasecmp(str, "raw") == 0 || strcasecmp(str, "none") == 0) return CONTAINER_RAW_UDP;
+    if (strcasecmp(str, "file") == 0 || strcasecmp(str, "mp4") == 0 ||
+        strcasecmp(str, "mkv") == 0 || strcasecmp(str, "avi") == 0) return CONTAINER_FILE;
     return CONTAINER_RTP;  /* Default */
 }
 
@@ -342,25 +349,46 @@ static gchar *build_encoder_string(FrameBuffer *fb) {
 }
 
 /* ========== Build Muxer/Payloader String ========== */
+/* NOTE: All strings start with "! " to properly link after encoder */
 static gchar *build_muxer_string(FrameBuffer *fb) {
     switch (fb->container) {
         case CONTAINER_SHM:
             return g_strdup_printf(
-                "shmsink socket-path=%s shm-size=%" G_GUINT64_FORMAT " wait-for-connection=false sync=false",
+                "! shmsink socket-path=%s shm-size=%" G_GUINT64_FORMAT " wait-for-connection=false sync=false",
                 fb->shm_path, fb->shm_size
             );
 
         case CONTAINER_MPEGTS:
             return g_strdup_printf(
-                "mpegtsmux ! udpsink host=%s port=%d sync=false",
+                "! mpegtsmux ! udpsink host=%s port=%d sync=false",
                 fb->output_host, fb->output_port
             );
 
         case CONTAINER_RAW_UDP:
             return g_strdup_printf(
-                "udpsink host=%s port=%d sync=false",
+                "! udpsink host=%s port=%d sync=false",
                 fb->output_host, fb->output_port
             );
+
+        case CONTAINER_FILE:
+            /* File muxer based on codec */
+            if (fb->codec == CODEC_RAW) {
+                return g_strdup_printf(
+                    "! avimux ! filesink location=%s",
+                    fb->output_file ? fb->output_file : "output.avi"
+                );
+            } else if (fb->codec == CODEC_VP8 || fb->codec == CODEC_VP9) {
+                return g_strdup_printf(
+                    "! matroskamux ! filesink location=%s",
+                    fb->output_file ? fb->output_file : "output.mkv"
+                );
+            } else {
+                /* H.264, H.265 -> MP4 */
+                return g_strdup_printf(
+                    "! mp4mux ! filesink location=%s",
+                    fb->output_file ? fb->output_file : "output.mp4"
+                );
+            }
 
         case CONTAINER_RTP:
         default:
@@ -368,32 +396,32 @@ static gchar *build_muxer_string(FrameBuffer *fb) {
             switch (fb->codec) {
                 case CODEC_RAW:
                     return g_strdup_printf(
-                        "rtpvrawpay mtu=%d ! udpsink host=%s port=%d sync=false",
+                        "! rtpvrawpay mtu=%d ! udpsink host=%s port=%d sync=false",
                         DEFAULT_RTP_MTU, fb->output_host, fb->output_port
                     );
                 case CODEC_H264:
                     return g_strdup_printf(
-                        "rtph264pay config-interval=1 mtu=%d ! udpsink host=%s port=%d sync=false",
+                        "! rtph264pay config-interval=1 mtu=%d ! udpsink host=%s port=%d sync=false",
                         DEFAULT_RTP_MTU, fb->output_host, fb->output_port
                     );
                 case CODEC_H265:
                     return g_strdup_printf(
-                        "rtph265pay config-interval=1 mtu=%d ! udpsink host=%s port=%d sync=false",
+                        "! rtph265pay config-interval=1 mtu=%d ! udpsink host=%s port=%d sync=false",
                         DEFAULT_RTP_MTU, fb->output_host, fb->output_port
                     );
                 case CODEC_VP8:
                     return g_strdup_printf(
-                        "rtpvp8pay mtu=%d ! udpsink host=%s port=%d sync=false",
+                        "! rtpvp8pay mtu=%d ! udpsink host=%s port=%d sync=false",
                         DEFAULT_RTP_MTU, fb->output_host, fb->output_port
                     );
                 case CODEC_VP9:
                     return g_strdup_printf(
-                        "rtpvp9pay mtu=%d ! udpsink host=%s port=%d sync=false",
+                        "! rtpvp9pay mtu=%d ! udpsink host=%s port=%d sync=false",
                         DEFAULT_RTP_MTU, fb->output_host, fb->output_port
                     );
                 default:
                     return g_strdup_printf(
-                        "udpsink host=%s port=%d sync=false",
+                        "! udpsink host=%s port=%d sync=false",
                         fb->output_host, fb->output_port
                     );
             }
@@ -415,9 +443,9 @@ static gboolean create_output_pipeline(FrameBuffer *fb) {
 
     gchar *pipeline_str;
     if (fb->container == CONTAINER_SHM && fb->codec == CODEC_RAW) {
-        /* SHM with raw frames - direct output */
+        /* SHM with raw frames - direct output (muxer_str starts with "!") */
         pipeline_str = g_strdup_printf(
-            "appsrc name=src is-live=true format=time do-timestamp=true caps=\"%s\" ! %s",
+            "appsrc name=src is-live=true format=time do-timestamp=true caps=\"%s\" %s",
             caps_str, muxer_str
         );
     } else if (shm_with_encoding) {
@@ -426,11 +454,16 @@ static gboolean create_output_pipeline(FrameBuffer *fb) {
             "appsrc name=src is-live=true format=time do-timestamp=true caps=\"%s\" ! %s%s",
             caps_str, encoder_str, muxer_str
         );
-    } else {
-        /* Normal UDP output */
+    } else if (fb->codec == CODEC_RAW) {
+        /* Raw codec (no encoder) - muxer_str starts with "!" */
         pipeline_str = g_strdup_printf(
-            "appsrc name=src is-live=true format=time do-timestamp=%s caps=\"%s\" ! %s%s",
-            (fb->codec == CODEC_RAW) ? "true" : "false",
+            "appsrc name=src is-live=true format=time do-timestamp=true caps=\"%s\" %s",
+            caps_str, muxer_str
+        );
+    } else {
+        /* Normal output with encoder - encoder_str ends with parser, muxer_str starts with "!" */
+        pipeline_str = g_strdup_printf(
+            "appsrc name=src is-live=true format=time do-timestamp=false caps=\"%s\" ! %s%s",
             caps_str, encoder_str, muxer_str
         );
     }
@@ -460,6 +493,15 @@ static gboolean create_output_pipeline(FrameBuffer *fb) {
         g_print("[FrameBuffer] Output: %s/%s @ %s, %dx%d @ %dfps\n",
                 codec_to_string(fb->codec), container_to_string(fb->container),
                 fb->shm_path, fb->width, fb->height, fb->fps);
+    } else if (fb->container == CONTAINER_FILE) {
+        g_print("[FrameBuffer] Output: %s/%s @ %s, %dx%d @ %dfps",
+                codec_to_string(fb->codec), container_to_string(fb->container),
+                fb->output_file ? fb->output_file : "output.*",
+                fb->width, fb->height, fb->fps);
+        if (fb->codec != CODEC_RAW) {
+            g_print(", %dkbps", fb->bitrate);
+        }
+        g_print("\n");
     } else {
         g_print("[FrameBuffer] Output: %s/%s @ %s:%d, %dx%d @ %dfps",
                 codec_to_string(fb->codec), container_to_string(fb->container),
@@ -689,7 +731,8 @@ static void print_usage(const char *prog) {
 
     g_print("OUTPUT FORMAT:\n");
     g_print("  -c, --codec CODEC          Output codec: raw, h264, h265, vp8, vp9 (default: h264)\n");
-    g_print("  -C, --container CONT       Container: rtp, mpegts, shm, raw (default: mpegts)\n");
+    g_print("  -C, --container CONT       Container: rtp, mpegts, shm, raw, file (default: mpegts)\n");
+    g_print("  -F, --file PATH            Output file path (auto-sets container to file)\n");
     g_print("\n");
 
     g_print("SHARED MEMORY OPTIONS (when -C shm):\n");
@@ -707,10 +750,14 @@ static void print_usage(const char *prog) {
     g_print("CODEC + CONTAINER COMBINATIONS:\n");
     g_print("  h264/mpegts   H.264 in MPEG-TS (default, broadcast compatible)\n");
     g_print("  h264/rtp      H.264 RTP payload (SDP compatible)\n");
+    g_print("  h264/file     H.264 in MP4 file\n");
     g_print("  h265/mpegts   H.265/HEVC in MPEG-TS\n");
     g_print("  h265/rtp      H.265/HEVC RTP payload\n");
+    g_print("  h265/file     H.265/HEVC in MP4 file\n");
     g_print("  vp8/rtp       VP8 RTP (WebRTC compatible)\n");
+    g_print("  vp8/file      VP8 in MKV file\n");
     g_print("  vp9/rtp       VP9 RTP (WebRTC compatible)\n");
+    g_print("  vp9/file      VP9 in MKV file\n");
     g_print("  raw/shm       Raw I420 frames to shared memory (IPC)\n");
     g_print("  raw/rtp       Raw video RTP (high bandwidth)\n");
     g_print("\n");
@@ -721,6 +768,8 @@ static void print_usage(const char *prog) {
     g_print("  %s -i 5000 -c h265 -C mpegts -b 4000          # H.265/MPEG-TS 4Mbps\n", prog);
     g_print("  %s -i 5000 -c raw -C shm -p /tmp/fb.sock      # Raw frames to SHM\n", prog);
     g_print("  %s -i 5000 -c h264 -C rtp -w 1920 -h 1080     # H.264/RTP 1080p\n", prog);
+    g_print("  %s -i 5000 -F output.mp4                      # Record to MP4 file\n", prog);
+    g_print("  %s -i 5000 -c vp9 -F output.mkv               # Record VP9 to MKV\n", prog);
 }
 
 static void print_version(void) {
@@ -750,6 +799,7 @@ int main(int argc, char *argv[]) {
         {"container",     required_argument, 0, 'C'},
         {"shm-path",      required_argument, 0, 'p'},
         {"shm-size",      required_argument, 0, 'Z'},
+        {"file",          required_argument, 0, 'F'},
         {"stats-interval",required_argument, 0, 'S'},
         {"verbose",       no_argument,       0, 'V'},
         {"help",          no_argument,       0, '?'},
@@ -760,7 +810,7 @@ int main(int argc, char *argv[]) {
     int opt;
     int option_index = 0;
 
-    while ((opt = getopt_long(argc, argv, "i:B:j:Q:o:H:w:h:f:b:k:c:C:p:Z:S:V",
+    while ((opt = getopt_long(argc, argv, "i:B:j:Q:o:H:w:h:f:b:k:c:C:p:Z:F:S:V",
                               long_options, &option_index)) != -1) {
         switch (opt) {
             case 'i':
@@ -809,6 +859,10 @@ int main(int argc, char *argv[]) {
                 break;
             case 'Z':
                 fb->shm_size = strtoull(optarg, NULL, 10);
+                break;
+            case 'F':
+                fb->output_file = g_strdup(optarg);
+                fb->container = CONTAINER_FILE;  /* Auto-set container to file */
                 break;
             case 'S':
                 fb->stats_interval = atoi(optarg);
