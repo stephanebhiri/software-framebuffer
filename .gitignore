@@ -1,0 +1,16 @@
+# Build output
+framebuffer
+
+# macOS
+.DS_Store
+*.dSYM/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Debug
+*.log
+core
