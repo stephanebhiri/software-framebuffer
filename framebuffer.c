@@ -59,6 +59,7 @@
 
 /* RTP defaults */
 #define DEFAULT_RTP_MTU             1200
+#define DEFAULT_NO_SIGNAL_TIMEOUT   5000000000  /* 5 seconds in nanoseconds */
 
 /* ========== Enums ========== */
 
@@ -92,6 +93,8 @@ typedef struct {
     /* Frame buffer (single frame, mutex protected) */
     GstBuffer *current_frame;
     GstCaps *current_caps;
+    GstBuffer *fallback_frame;    /* Pre-allocated grey frame (avoid memory churn) */
+    GstClockTime last_input_time; /* For no-signal timeout detection */
     GMutex frame_mutex;
 
     /* Render loop */
@@ -215,6 +218,8 @@ static FrameBuffer *framebuffer_new(void) {
     fb->running = FALSE;
     fb->current_frame = NULL;
     fb->current_caps = NULL;
+    fb->fallback_frame = NULL;      /* Created after we know dimensions */
+    fb->last_input_time = 0;        /* No input yet */
 
     /* Input defaults */
     fb->input_port = DEFAULT_INPUT_PORT;
@@ -441,30 +446,37 @@ static gboolean create_output_pipeline(FrameBuffer *fb) {
     /* For SHM output with encoded video, we need different handling */
     gboolean shm_with_encoding = (fb->container == CONTAINER_SHM && fb->codec != CODEC_RAW);
 
+    /*
+     * CRITICAL FIX (intern review):
+     * Always use do-timestamp=false because render_loop calculates precise PTS.
+     * If do-timestamp=true, appsrc would overwrite our carefully calculated timestamps.
+     */
+    const char *appsrc_props = "appsrc name=src is-live=true format=time do-timestamp=false";
+
     gchar *pipeline_str;
     if (fb->container == CONTAINER_SHM && fb->codec == CODEC_RAW) {
-        /* SHM with raw frames - direct output (muxer_str starts with "!") */
+        /* SHM with raw frames (muxer_str starts with "!") */
         pipeline_str = g_strdup_printf(
-            "appsrc name=src is-live=true format=time do-timestamp=true caps=\"%s\" %s",
-            caps_str, muxer_str
+            "%s caps=\"%s\" %s",
+            appsrc_props, caps_str, muxer_str
         );
     } else if (shm_with_encoding) {
-        /* SHM with encoded video - not typical but supported */
+        /* SHM with encoded video */
         pipeline_str = g_strdup_printf(
-            "appsrc name=src is-live=true format=time do-timestamp=true caps=\"%s\" ! %s%s",
-            caps_str, encoder_str, muxer_str
+            "%s caps=\"%s\" ! %s%s",
+            appsrc_props, caps_str, encoder_str, muxer_str
         );
     } else if (fb->codec == CODEC_RAW) {
         /* Raw codec (no encoder) - muxer_str starts with "!" */
         pipeline_str = g_strdup_printf(
-            "appsrc name=src is-live=true format=time do-timestamp=true caps=\"%s\" %s",
-            caps_str, muxer_str
+            "%s caps=\"%s\" %s",
+            appsrc_props, caps_str, muxer_str
         );
     } else {
-        /* Normal output with encoder - encoder_str ends with parser, muxer_str starts with "!" */
+        /* Normal output with encoder */
         pipeline_str = g_strdup_printf(
-            "appsrc name=src is-live=true format=time do-timestamp=false caps=\"%s\" ! %s%s",
-            caps_str, encoder_str, muxer_str
+            "%s caps=\"%s\" ! %s%s",
+            appsrc_props, caps_str, encoder_str, muxer_str
         );
     }
 
@@ -538,6 +550,7 @@ static GstFlowReturn on_new_sample(GstElement *sink, FrameBuffer *fb) {
 
     fb->frames_in++;
     fb->in_seq++;
+    fb->last_input_time = g_get_monotonic_time() * 1000;  /* Record input time (ns) */
 
     g_mutex_unlock(&fb->frame_mutex);
 
@@ -584,23 +597,47 @@ static gpointer render_loop(gpointer data) {
     GstClockTime base_time = gst_element_get_base_time(GST_ELEMENT(fb->output_pipeline));
     guint64 frame_count = 0;
     guint64 stats_frames = (fb->stats_interval > 0) ? fb->fps * fb->stats_interval : 0;
+    gboolean signal_lost_logged = FALSE;
 
     while (fb->running) {
         GstBuffer *buffer_to_push = NULL;
         gboolean is_repeat = FALSE;
+        gboolean use_fallback = FALSE;
         guint64 current_seq = 0;
 
         g_mutex_lock(&fb->frame_mutex);
 
-        if (fb->current_frame) {
+        /* Check for no-signal timeout: if last input was more than 5 seconds ago */
+        GstClockTime now = g_get_monotonic_time() * 1000;  /* ns */
+        gboolean signal_timeout = (fb->last_input_time > 0) &&
+                                  ((now - fb->last_input_time) > DEFAULT_NO_SIGNAL_TIMEOUT);
+
+        if (fb->current_frame && !signal_timeout) {
+            /* Normal case: we have a valid, recent frame */
             buffer_to_push = gst_buffer_copy(fb->current_frame);
             current_seq = fb->in_seq;
+            signal_lost_logged = FALSE;
         } else {
-            buffer_to_push = create_fallback_frame(fb);
+            /* No frame or signal timeout: use cached fallback frame */
+            use_fallback = TRUE;
             is_repeat = TRUE;
+            if (signal_timeout && !signal_lost_logged) {
+                g_print("[FrameBuffer] No signal for 5s, switching to fallback frame\n");
+                signal_lost_logged = TRUE;
+            }
         }
 
         g_mutex_unlock(&fb->frame_mutex);
+
+        /* Use pre-allocated fallback frame (copy to avoid ownership issues) */
+        if (use_fallback) {
+            if (fb->fallback_frame) {
+                buffer_to_push = gst_buffer_copy(fb->fallback_frame);
+            } else {
+                /* Fallback not yet created - create one (should not happen normally) */
+                buffer_to_push = create_fallback_frame(fb);
+            }
+        }
 
         if (!is_repeat && current_seq == fb->last_pushed_seq) {
             is_repeat = TRUE;
@@ -616,6 +653,10 @@ static gpointer render_loop(gpointer data) {
             GST_APP_SRC(fb->appsrc), buffer_to_push);
 
         if (ret != GST_FLOW_OK) {
+            if (ret == GST_FLOW_FLUSHING || ret == GST_FLOW_EOS) {
+                g_print("[FrameBuffer] Output pipeline flushing/EOS, stopping loop\n");
+                break;
+            }
             g_printerr("[FrameBuffer] Push error: %d\n", ret);
         }
 
@@ -648,6 +689,12 @@ static gboolean start_pipelines_idle(gpointer data) {
     FrameBuffer *fb = (FrameBuffer *)data;
 
     g_print("[FrameBuffer] Starting pipelines...\n");
+
+    /* Pre-allocate fallback frame (grey) to avoid memory churn */
+    if (!fb->fallback_frame) {
+        fb->fallback_frame = create_fallback_frame(fb);
+        g_print("[FrameBuffer] Fallback frame pre-allocated\n");
+    }
 
     gst_element_set_state(fb->output_pipeline, GST_STATE_PLAYING);
 
@@ -689,6 +736,7 @@ static void framebuffer_stop(FrameBuffer *fb) {
 static void framebuffer_free(FrameBuffer *fb) {
     if (fb->current_frame) gst_buffer_unref(fb->current_frame);
     if (fb->current_caps) gst_caps_unref(fb->current_caps);
+    if (fb->fallback_frame) gst_buffer_unref(fb->fallback_frame);
     if (fb->input_pipeline) gst_object_unref(fb->input_pipeline);
     if (fb->output_pipeline) gst_object_unref(fb->output_pipeline);
     g_free(fb->output_host);
