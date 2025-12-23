@@ -105,6 +105,10 @@ typedef struct {
     GThread *render_thread;
     gboolean running;
 
+    /* Auto-recovery */
+    gboolean input_restart_pending;
+    guint restart_timeout_id;
+
     /* Stats */
     guint64 frames_in;
     guint64 frames_out;
@@ -155,6 +159,11 @@ static GstFlowReturn on_new_sample(GstElement *sink, FrameBuffer *fb);
 static gpointer render_loop(gpointer data);
 static GstBuffer *create_fallback_frame(FrameBuffer *fb);
 static void on_bus_error(GstBus *bus, GstMessage *msg, gpointer data);
+static gboolean restart_input_pipeline(gpointer data);
+static gboolean create_input_pipeline(FrameBuffer *fb);
+
+/* Global reference for signal handler and auto-recovery (declared before signal_handler) */
+static FrameBuffer *g_fb = NULL;
 
 /* ========== Helper Functions ========== */
 
@@ -211,8 +220,47 @@ static void on_bus_error(GstBus *bus, GstMessage *msg, gpointer data) {
     if (debug) {
         g_printerr("[FrameBuffer] Debug: %s\n", debug);
     }
+
+    /* Auto-restart input pipeline on errors (codec change, stream errors, etc.)
+     * This keeps FrameBuffer decoupled from source - it handles errors internally */
+    if (strcmp(pipeline_name, "INPUT") == 0 && g_fb && !g_fb->input_restart_pending) {
+        g_fb->input_restart_pending = TRUE;
+        g_print("[FrameBuffer] Input error detected, scheduling auto-restart in 1s...\n");
+        g_fb->restart_timeout_id = g_timeout_add(1000, restart_input_pipeline, g_fb);
+    }
+
     g_error_free(err);
     g_free(debug);
+}
+
+/**
+ * Restart the input pipeline (auto-recovery from codec changes/errors)
+ */
+static gboolean restart_input_pipeline(gpointer data) {
+    FrameBuffer *fb = (FrameBuffer *)data;
+
+    g_print("[FrameBuffer] Restarting input pipeline for auto-recovery...\n");
+
+    /* Stop old input pipeline */
+    if (fb->input_pipeline) {
+        gst_element_set_state(fb->input_pipeline, GST_STATE_NULL);
+        gst_object_unref(fb->input_pipeline);
+        fb->input_pipeline = NULL;
+        fb->appsink = NULL;
+    }
+
+    /* Create new input pipeline */
+    if (create_input_pipeline(fb)) {
+        gst_element_set_state(fb->input_pipeline, GST_STATE_PLAYING);
+        g_print("[FrameBuffer] Input pipeline restarted successfully\n");
+    } else {
+        g_printerr("[FrameBuffer] Failed to restart input pipeline!\n");
+    }
+
+    fb->input_restart_pending = FALSE;
+    fb->restart_timeout_id = 0;
+
+    return G_SOURCE_REMOVE;
 }
 
 static void on_bus_warning(GstBus *bus, GstMessage *msg, gpointer data) {
@@ -799,8 +847,6 @@ static void framebuffer_free(FrameBuffer *fb) {
 }
 
 /* ========== Signal Handler ========== */
-static FrameBuffer *g_fb = NULL;
-
 static void signal_handler(int sig) {
     g_print("\n[FrameBuffer] Signal %d received, shutting down...\n", sig);
     if (g_fb && g_fb->loop) {
