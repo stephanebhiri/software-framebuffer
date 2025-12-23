@@ -16,7 +16,12 @@ import { spawn } from 'child_process';
 import { parseKLV, formatKLVForDisplay } from './parsers/klv.js';
 import FFmpegService from './services/ffmpeg.js';
 import WebRTCGatewayC from './services/webrtc-gateway-c.js';
+import FrameBufferService from './services/framebuffer.js';
+import UDPKLVSplitter from './services/udp-klv-splitter.js';
 import orchestrator from './services/orchestrator.js';
+
+// Shared memory path for FrameBuffer <-> WebRTC Gateway communication
+const SHM_PATH = '/tmp/framebuffer.sock';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -38,6 +43,7 @@ app.use('/hls', express.static(hlsDir));
 const clients = new Map(); // ws -> { id, ... }
 let ffmpegService = null;
 let webrtcService = null;
+let framebufferService = null;  // FrameBuffer for seamless source switching
 let currentSource = null;
 let streamMode = null; // 'file' or 'udp'
 
@@ -271,76 +277,88 @@ async function startFileStream(filePath) {
   });
 }
 
-// ===== UDP STREAM MODE with WebRTC (C Gateway - Zero UDP forwarding) =====
-// Architecture:
-// FFmpeg simulator -> UDP:5000 -> FrameBuffer (1s buffer + decode + VP8 encode) -> UDP:5002 -> WebRTC Gateway -> Chrome
-// FrameBuffer provides: stable framerate, seamless source switching, jitter absorption
-let framebufferProcess = null;
+// ===== UDP STREAM MODE with WebRTC (KLVSplitter + FrameBuffer + WebRTC Gateway) =====
+// Architecture: Source -> UDP:5000 -> KLVSplitter -> UDP:5001 -> FrameBuffer -> SharedMem -> WebRTC Gateway -> Chrome
+//                                         ↓
+//                                    Parse KLV -> WebSocket -> Frontend
+let klvSplitter = null;
 
 async function startUDPStream(port = 5000) {
   console.log('Starting UDP stream on port:', port);
 
-  // Cold start: stop everything and start fresh
+  // Stop everything and start fresh
   await stopStream();
 
   currentSource = `udp://0.0.0.0:${port}`;
   streamMode = 'udp';
 
-  const fbPort = port + 2; // FrameBuffer outputs to port+2 (e.g., 5000 -> 5002)
-
-  // 1. Start FrameBuffer (decode + 1s buffer + VP8 encode)
-  const fbPath = join(__dirname, '../bin/framebuffer');
-  if (!existsSync(fbPath)) {
-    console.error('FrameBuffer binary not found:', fbPath);
-    broadcast({ type: 'error', message: 'FrameBuffer binary not found' });
-    return;
-  }
-
-  // FrameBuffer args: -i input_port -o output_port -v (VP8 RTP output) -w width -h height -f fps
-  const fbArgs = ['-i', String(port), '-o', String(fbPort), '-v', '-w', '640', '-h', '480', '-f', '30', '-b', '2000'];
-  console.log(`Starting FrameBuffer: ${fbPath} ${fbArgs.join(' ')}`);
-
-  const fbEnv = {
-    ...process.env,
-    GST_PLUGIN_FEATURE_RANK: 'vtdec:0,vtdec_hw:0,vtdechw:0'  // Force software decoder for MPEG2 4K
-  };
-
-  framebufferProcess = spawn(fbPath, fbArgs, { stdio: ['pipe', 'pipe', 'pipe'], env: fbEnv });
-
-  framebufferProcess.stdout.on('data', (data) => {
-    const lines = data.toString().split('\n').filter(l => l.trim());
-    for (const line of lines) console.log('[FrameBuffer]', line);
-  });
-
-  framebufferProcess.stderr.on('data', (data) => {
-    const lines = data.toString().split('\n').filter(l => l.trim());
-    for (const line of lines) console.log('[FrameBuffer]', line);
-  });
-
-  framebufferProcess.on('close', (code) => {
-    console.log(`FrameBuffer exited with code ${code}`);
-    framebufferProcess = null;
-  });
-
-  // Wait for FrameBuffer to initialize
-  await new Promise(r => setTimeout(r, 2000));
-
-  // 2. Reinitialize WebRTC service if needed
+  // Reinitialize WebRTC service if needed
   if (!webrtcService) {
     webrtcService = setupWebRTCService();
   }
 
-  // 3. Start WebRTC Gateway (reads VP8 RTP from FrameBuffer output)
+  const forwardPort = port + 1;  // KLVSplitter forwards to port+1
+
   try {
-    await webrtcService.start('udp', {
-      port: fbPort,  // Read from FrameBuffer output port
+    // 1. Start KLV Splitter: UDP input → extract KLV + forward to FrameBuffer
+    if (!klvSplitter) {
+      klvSplitter = new UDPKLVSplitter();
+      klvSplitter.on('klv', ({ data: klvData, pid }) => {
+        try {
+          const { packets } = parseKLV(klvData);
+          for (const pkt of packets) {
+            const formatted = formatKLVForDisplay(pkt);
+            // Use PID as primary sensor identifier (reliable for multi-PID streams)
+            // Fall back to imageSourceSensor name for display
+            const sensorName = pkt.imageSourceSensor || pkt.sensorName || `PID-${pid.toString(16)}`;
+            const sensorId = `pid-${pid.toString(16)}`;
+            // Debug: log unique sensors
+            if (!klvSplitter._seenSensors) klvSplitter._seenSensors = new Set();
+            if (!klvSplitter._seenSensors.has(sensorId)) {
+              klvSplitter._seenSensors.add(sensorId);
+              console.log(`[KLV] New sensor detected: PID 0x${pid.toString(16)} "${sensorName}"`);
+            }
+            broadcast({ type: 'klv', sensorId, sensorName, data: formatted });
+          }
+        } catch (err) {
+          // Ignore parse errors
+        }
+      });
+    }
+    await klvSplitter.start({
+      inputPort: port,
+      outputPort: forwardPort,
+      outputHost: '127.0.0.1'
+    });
+    console.log(`KLV Splitter started: UDP:${port} → UDP:${forwardPort} + KLV extraction`);
+
+    // 2. Start FrameBuffer: UDP input (forwarded) → decode → SharedMem output
+    if (!framebufferService) {
+      framebufferService = new FrameBufferService();
+    }
+    await framebufferService.start({
+      inputPort: forwardPort,  // Listen on forwarded port
       width: 640,
       height: 480,
+      fps: 30,
+      jitterBuffer: 500,   // 0.5 seconds jitter buffer
+      codec: 'raw',        // Raw frames for SharedMem
+      container: 'shm',    // Shared memory output
+      shmPath: SHM_PATH
+    });
+    console.log(`FrameBuffer started: UDP:${forwardPort} → SharedMem:${SHM_PATH}`);
+
+    // 2. Start WebRTC Gateway: SharedMem input → VP8 encode → WebRTC
+    await webrtcService.start('shm', {
+      shmPath: SHM_PATH,
+      width: 640,
+      height: 480,
+      fps: 30,
       bitrate: 2000
     });
-    console.log(`WebRTC Gateway started on port ${fbPort} (from FrameBuffer)`);
+    console.log(`WebRTC Gateway started: SharedMem:${SHM_PATH} → WebRTC`);
   } catch (error) {
-    console.error('Failed to start WebRTC Gateway:', error);
+    console.error('Failed to start UDP stream:', error);
     broadcast({ type: 'error', message: error.message });
     return;
   }
@@ -377,18 +395,22 @@ async function stopStream() {
   // Stop all managed processes via orchestrator
   orchestrator.stopAll();
 
-  // Stop FrameBuffer
-  if (framebufferProcess && !framebufferProcess.killed) {
-    console.log('Stopping FrameBuffer');
-    framebufferProcess.kill('SIGTERM');
-    framebufferProcess = null;
-  }
-
   if (ffmpegService) {
     ffmpegService.stop();
     ffmpegService = null;
   }
 
+  // Stop KLV Splitter
+  if (klvSplitter?.isRunning) {
+    await klvSplitter.stop();
+  }
+
+  // Stop FrameBuffer
+  if (framebufferService?.isRunning) {
+    await framebufferService.stop();
+  }
+
+  // Stop WebRTC Gateway
   if (webrtcService?.isReady) {
     await webrtcService.stop();
     // Reinitialize for next use
@@ -408,6 +430,8 @@ app.get('/api/status', (req, res) => {
     mode: streamMode,
     clients: clients.size,
     webrtcReady: webrtcService?.isReady || false,
+    framebufferRunning: framebufferService?.isRunning || false,
+    framebufferStats: framebufferService?.stats || null,
     simulator: simulatorProcess ? { running: true, codec: simulatorCodec } : { running: false },
     processes: orchestrator.getAllStatus()
   });
@@ -451,6 +475,7 @@ app.post('/api/stream/stop', async (req, res) => {
 // ===== Simulator Control =====
 let simulatorProcess = null;
 let simulatorCodec = 'h264';
+let simulatorFileId = null;
 const SIMULATOR_PID_FILE = join(__dirname, '../.simulator.pid');
 
 function killSimulator() {
@@ -483,6 +508,7 @@ function killSimulator() {
 const SAMPLE_FILES = [
   { id: 'cheyenne', name: 'Cheyenne', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/MISB/Cheyenne.ts', codec: 'h264' },
   { id: 'falls', name: 'Falls', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/MISB/falls.ts', codec: 'h264' },
+  { id: 'truck', name: 'Truck', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/FMV tutorial data/Truck.ts', codec: 'h264' },
   { id: 'klv_test', name: 'KLV Test Sync', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/MISB/klv_metadata_test_sync.ts', codec: 'h264' },
   { id: 'day_flight', name: 'Day Flight', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/Day_Flight.mpg', codec: 'h264' },
   { id: 'night_flight', name: 'Night Flight IR', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/Night_Flight_IR.mpg', codec: 'h264' },
@@ -492,6 +518,14 @@ const SAMPLE_FILES = [
 
 app.get('/api/simulator/files', (req, res) => {
   res.json({ files: SAMPLE_FILES });
+});
+
+app.get('/api/simulator/status', (req, res) => {
+  res.json({
+    running: !!simulatorProcess,
+    fileId: simulatorFileId,
+    codec: simulatorCodec
+  });
 });
 
 app.post('/api/simulator/start', async (req, res) => {
@@ -543,18 +577,25 @@ app.post('/api/simulator/start', async (req, res) => {
   simulatorProcess.on('close', (code) => {
     console.log('Simulator stopped, code:', code);
     simulatorProcess = null;
+    simulatorFileId = null;
     if (existsSync(SIMULATOR_PID_FILE)) unlinkSync(SIMULATOR_PID_FILE);
   });
 
   writeFileSync(SIMULATOR_PID_FILE, String(simulatorProcess.pid));
   simulatorCodec = file.codec || 'h264';
+  simulatorFileId = fileId;
   console.log(`Simulator started: ${file.name} -> udp://127.0.0.1:${port} (PID: ${simulatorProcess.pid}, codec: ${simulatorCodec})`);
 
-  // Handle source switch when UDP stream is running
-  // The C gateway handles source changes - decodebin3 adapts automatically
-  if (streamMode === 'udp' && webrtcService?.isReady) {
-    console.log(`Source switch to ${file.name} - C gateway will handle transition`);
+  // FrameBuffer is DECOUPLED from simulator - it handles codec changes internally
+  // No restart needed here - FrameBuffer auto-recovers on input errors
+  if (streamMode === 'udp') {
+    console.log(`Source switch to ${file.name} - FrameBuffer handles codec changes internally`);
     broadcast({ type: 'source-switching', file: file.name });
+
+    // Notify frontend after source settles
+    setTimeout(() => {
+      broadcast({ type: 'source-switched', file: file.name, codec: file.codec });
+    }, 2000);
   }
 
   res.json({ success: true, file: file.name, port, codec: simulatorCodec });
@@ -594,6 +635,15 @@ async function gracefulShutdown(signal) {
     await stopStream();
   } catch (error) {
     console.error('Error stopping streams:', error);
+  }
+
+  // Stop framebuffer if running
+  try {
+    if (framebufferService?.isRunning) {
+      await framebufferService.stop();
+    }
+  } catch (error) {
+    console.error('Error stopping framebuffer:', error);
   }
 
   try {

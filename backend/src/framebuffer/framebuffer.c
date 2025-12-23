@@ -33,6 +33,10 @@ typedef struct {
     GThread *render_thread;
     gboolean running;
 
+    // Auto-recovery
+    gboolean input_restart_pending;
+    guint restart_timeout_id;
+
     // Stats
     guint64 frames_in;
     guint64 frames_out;
@@ -50,6 +54,8 @@ typedef struct {
     gint bitrate;
     gboolean raw_output;  // Output raw video instead of H.264 MPEG-TS
     gboolean vp8_output;  // Output VP8 RTP (for direct WebRTC)
+    gboolean shm_output;  // Output to shared memory for WebRTC Gateway
+    gchar *shm_path;      // Shared memory socket path
 
     GMainLoop *loop;
 } FrameBuffer;
@@ -60,9 +66,14 @@ static gpointer render_loop(gpointer data);
 static GstBuffer *create_fallback_frame(FrameBuffer *fb);
 static void on_bus_error(GstBus *bus, GstMessage *msg, gpointer data);
 static void on_demux_pad_added(GstElement *demux, GstPad *pad, gpointer data);
+static gboolean restart_input_pipeline(gpointer data);
+static gboolean create_input_pipeline(FrameBuffer *fb);
+
+// Global reference for error handler (needed to schedule restart)
+static FrameBuffer *g_fb = NULL;
 
 /**
- * Bus error handler
+ * Bus error handler - triggers auto-restart on INPUT errors
  */
 static void on_bus_error(GstBus *bus, GstMessage *msg, gpointer data) {
     const char *pipeline_name = (const char *)data;
@@ -74,8 +85,49 @@ static void on_bus_error(GstBus *bus, GstMessage *msg, gpointer data) {
     if (debug) {
         g_printerr("[FrameBuffer] Debug: %s\n", debug);
     }
+
+    // Auto-restart input pipeline on errors (codec change, stream errors, etc.)
+    // This keeps FrameBuffer decoupled from the source - it just recovers
+    if (strcmp(pipeline_name, "INPUT") == 0 && g_fb && !g_fb->input_restart_pending) {
+        g_fb->input_restart_pending = TRUE;
+        g_print("[FrameBuffer] Input error detected, scheduling auto-restart in 1s...\n");
+        // Schedule restart after 1 second to let old stream clear
+        g_fb->restart_timeout_id = g_timeout_add(1000, restart_input_pipeline, g_fb);
+    }
+
     g_error_free(err);
     g_free(debug);
+}
+
+/**
+ * Restart the input pipeline (auto-recovery from codec changes/errors)
+ * Called from main loop via g_timeout_add
+ */
+static gboolean restart_input_pipeline(gpointer data) {
+    FrameBuffer *fb = (FrameBuffer *)data;
+
+    g_print("[FrameBuffer] Restarting input pipeline for auto-recovery...\n");
+
+    // Stop old input pipeline
+    if (fb->input_pipeline) {
+        gst_element_set_state(fb->input_pipeline, GST_STATE_NULL);
+        gst_object_unref(fb->input_pipeline);
+        fb->input_pipeline = NULL;
+        fb->appsink = NULL;
+    }
+
+    // Create new input pipeline
+    if (create_input_pipeline(fb)) {
+        gst_element_set_state(fb->input_pipeline, GST_STATE_PLAYING);
+        g_print("[FrameBuffer] Input pipeline restarted successfully\n");
+    } else {
+        g_printerr("[FrameBuffer] Failed to restart input pipeline!\n");
+    }
+
+    fb->input_restart_pending = FALSE;
+    fb->restart_timeout_id = 0;
+
+    return G_SOURCE_REMOVE;  // Don't repeat
 }
 
 /**
@@ -273,6 +325,8 @@ static FrameBuffer *framebuffer_new(void) {
     fb->bitrate = 2000;
     fb->raw_output = FALSE;
     fb->vp8_output = FALSE;
+    fb->shm_output = FALSE;
+    fb->shm_path = g_strdup("/tmp/framebuffer.sock");
 
     return fb;
 }
@@ -288,13 +342,14 @@ static gboolean create_input_pipeline(FrameBuffer *fb) {
     // Build pipeline with gst_parse_launch for simplicity
     // Key fix: min-threshold-time=1000000000 (1 second buffer before playing)
     // This smooths out UDP jitter that was causing choppy video
+    // Use decodebin3 for automatic codec detection (H.264, MPEG2, etc.)
+    // IMPORTANT: force-sw-decoders=true avoids VideoToolbox hardware decoder
+    // which fails on codec switching (H264->MPEG2 gives error -12906)
     gchar *pipeline_str = g_strdup_printf(
         "udpsrc port=%d buffer-size=67108864 caps=\"video/mpegts,systemstream=true\" name=udpsrc "
         "! queue min-threshold-time=1000000000 max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 "
         "! tsparse "
-        "! tsdemux name=demux "
-        "! mpegvideoparse "
-        "! mpeg2dec "
+        "! decodebin3 "
         "! videoconvert "
         "! videoscale "
         "! video/x-raw,format=I420,width=%d,height=%d "
@@ -334,11 +389,12 @@ static gboolean create_input_pipeline(FrameBuffer *fb) {
 }
 
 /**
- * Create output pipeline: appsrc -> encode -> UDP
- * Supports three modes:
+ * Create output pipeline: appsrc -> encode -> UDP or Shared Memory
+ * Supports four modes:
  * - H.264 MPEG-TS (default): appsrc -> x264enc -> mpegtsmux -> udpsink
  * - Raw RTP (-r flag):       appsrc -> rtpvrawpay -> udpsink
  * - VP8 RTP (-v flag):       appsrc -> vp8enc -> rtpvp8pay -> udpsink
+ * - Shared Memory (-s flag): appsrc -> shmsink (for WebRTC Gateway)
  */
 static gboolean create_output_pipeline(FrameBuffer *fb) {
     gchar *caps_str = g_strdup_printf(
@@ -349,7 +405,18 @@ static gboolean create_output_pipeline(FrameBuffer *fb) {
     gchar *pipeline_str;
     const gchar *mode_name;
 
-    if (fb->vp8_output) {
+    if (fb->shm_output) {
+        // Shared Memory output - raw frames to shmsink for WebRTC Gateway
+        // This enables seamless source switching: FrameBuffer can restart
+        // without affecting the WebRTC connection
+        pipeline_str = g_strdup_printf(
+            "appsrc name=src is-live=true format=time do-timestamp=true "
+            "caps=\"%s\" "
+            "! shmsink socket-path=%s shm-size=20000000 wait-for-connection=false sync=false",
+            caps_str, fb->shm_path
+        );
+        mode_name = "Shared Memory";
+    } else if (fb->vp8_output) {
         // VP8 RTP output - WebRTC-ready, single encode
         pipeline_str = g_strdup_printf(
             "appsrc name=src is-live=true format=time do-timestamp=true "
@@ -576,8 +643,13 @@ static gboolean start_pipelines_idle(gpointer data) {
 
     g_print("[FrameBuffer] Running\n");
     g_print("[FrameBuffer] Input:  UDP port %d\n", fb->input_port);
-    g_print("[FrameBuffer] Output: %s:%d @ %dfps\n",
-            fb->output_host, fb->output_port, fb->fps);
+    if (fb->shm_output) {
+        g_print("[FrameBuffer] Output: Shared Memory %s @ %dfps\n",
+                fb->shm_path, fb->fps);
+    } else {
+        g_print("[FrameBuffer] Output: %s:%d @ %dfps\n",
+                fb->output_host, fb->output_port, fb->fps);
+    }
 
     return G_SOURCE_REMOVE;  // Don't call again
 }
@@ -624,6 +696,7 @@ static void framebuffer_free(FrameBuffer *fb) {
     if (fb->input_pipeline) gst_object_unref(fb->input_pipeline);
     if (fb->output_pipeline) gst_object_unref(fb->output_pipeline);
     g_free(fb->output_host);
+    g_free(fb->shm_path);
     g_mutex_clear(&fb->frame_mutex);
     g_free(fb);
 }
@@ -631,8 +704,6 @@ static void framebuffer_free(FrameBuffer *fb) {
 /**
  * Signal handler for clean shutdown
  */
-static FrameBuffer *g_fb = NULL;
-
 static void signal_handler(int sig) {
     g_print("\n[FrameBuffer] Signal %d received, shutting down...\n", sig);
     if (g_fb && g_fb->loop) {
@@ -655,6 +726,8 @@ static void print_usage(const char *prog) {
     g_print("  -b KBPS   Output bitrate in kbps (default: 2000)\n");
     g_print("  -r        Raw RTP output (no encoding)\n");
     g_print("  -v        VP8 RTP output (WebRTC-ready)\n");
+    g_print("  -s [PATH] Shared memory output for WebRTC Gateway\n");
+    g_print("            (default path: /tmp/framebuffer.sock)\n");
 }
 
 /**
@@ -687,6 +760,13 @@ int main(int argc, char *argv[]) {
             fb->raw_output = TRUE;
         } else if (strcmp(argv[i], "-v") == 0) {
             fb->vp8_output = TRUE;
+        } else if (strcmp(argv[i], "-s") == 0) {
+            fb->shm_output = TRUE;
+            // Optional path argument
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                g_free(fb->shm_path);
+                fb->shm_path = g_strdup(argv[++i]);
+            }
         } else if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
