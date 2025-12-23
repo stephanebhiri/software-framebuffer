@@ -15,13 +15,13 @@ import { spawn } from 'child_process';
 
 import { parseKLV, formatKLVForDisplay } from './parsers/klv.js';
 import FFmpegService from './services/ffmpeg.js';
-import WebRTCGatewayC from './services/webrtc-gateway-c.js';
+import { GStreamerWebRTCService } from './services/gstreamer-webrtc.js';
 import FrameBufferService from './services/framebuffer.js';
 import UDPKLVSplitter from './services/udp-klv-splitter.js';
 import orchestrator from './services/orchestrator.js';
 
-// Shared memory path for FrameBuffer <-> WebRTC Gateway communication
-const SHM_PATH = '/tmp/framebuffer.sock';
+// WebRTC output port (FrameBuffer VP8 RTP output)
+const WEBRTC_PORT = 5002;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -47,13 +47,13 @@ let framebufferService = null;  // FrameBuffer for seamless source switching
 let currentSource = null;
 let streamMode = null; // 'file' or 'udp'
 
-// ===== WebRTC Service Setup (C Gateway - Zero UDP forwarding) =====
+// ===== WebRTC Service Setup (GStreamer Python - VP8 RTP input) =====
 function setupWebRTCService() {
-  webrtcService = new WebRTCGatewayC();
+  webrtcService = new GStreamerWebRTCService();
 
-  // Handle SDP offer from C gateway
+  // Handle SDP offer from Python gateway
   webrtcService.on('offer', (clientId, sdp) => {
-    console.log(`WebRTC C: Sending offer to ${clientId}`);
+    console.log(`WebRTC: Sending offer to ${clientId}`);
     for (const [ws, client] of clients) {
       if (client.id === clientId && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
@@ -65,7 +65,7 @@ function setupWebRTCService() {
     }
   });
 
-  // Handle ICE candidate from C gateway
+  // Handle ICE candidate from Python gateway
   webrtcService.on('ice-candidate', (clientId, candidate) => {
     for (const [ws, client] of clients) {
       if (client.id === clientId && ws.readyState === WebSocket.OPEN) {
@@ -81,7 +81,7 @@ function setupWebRTCService() {
 
   // Handle client connection state
   webrtcService.on('client-connected', (clientId) => {
-    console.log(`WebRTC C: Client ${clientId} connected`);
+    console.log(`WebRTC: Client ${clientId} connected`);
     for (const [ws, client] of clients) {
       if (client.id === clientId && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'webrtc-connected' }));
@@ -92,12 +92,12 @@ function setupWebRTCService() {
 
   // Handle pipeline errors
   webrtcService.on('error', (err) => {
-    console.error('WebRTC C: Error:', err.message);
+    console.error('WebRTC: Error:', err.message);
     broadcast({ type: 'stream-error', message: err.message });
   });
 
   webrtcService.on('closed', (code) => {
-    console.log('WebRTC C: Closed with code:', code);
+    console.log('WebRTC: Closed with code:', code);
     if (streamMode === 'udp') {
       broadcast({ type: 'stream-ended' });
     }
@@ -332,31 +332,33 @@ async function startUDPStream(port = 5000) {
     });
     console.log(`KLV Splitter started: UDP:${port} → UDP:${forwardPort} + KLV extraction`);
 
-    // 2. Start FrameBuffer: UDP input (forwarded) → decode → SharedMem output
+    // 2. Start FrameBuffer: UDP input (forwarded) → decode → Raw RTP output
     if (!framebufferService) {
       framebufferService = new FrameBufferService();
     }
     await framebufferService.start({
       inputPort: forwardPort,  // Listen on forwarded port
+      outputPort: WEBRTC_PORT, // Raw RTP output to Python
+      outputHost: '127.0.0.1',
       width: 640,
       height: 480,
       fps: 30,
-      jitterBuffer: 500,   // 0.5 seconds jitter buffer
-      codec: 'raw',        // Raw frames for SharedMem
-      container: 'shm',    // Shared memory output
-      shmPath: SHM_PATH
+      bitrate: 2000,
+      codec: 'raw',           // Raw video output (Python does VP8 encode)
+      container: 'rtp'        // RTP output to Python
     });
-    console.log(`FrameBuffer started: UDP:${forwardPort} → SharedMem:${SHM_PATH}`);
+    console.log(`FrameBuffer started: UDP:${forwardPort} → Raw RTP:${WEBRTC_PORT}`);
 
-    // 2. Start WebRTC Gateway: SharedMem input → VP8 encode → WebRTC
-    await webrtcService.start('shm', {
-      shmPath: SHM_PATH,
+    // 3. Start WebRTC Gateway: Raw RTP input → VP8 encode → WebRTC
+    await webrtcService.start('udp', {
+      port: WEBRTC_PORT,
+      raw: true,              // Raw video input, encode to VP8 in Python
       width: 640,
       height: 480,
-      fps: 30,
-      bitrate: 2000
+      public_ip: process.env.PUBLIC_IP || null  // For NAT traversal (AWS EC2, etc.)
     });
-    console.log(`WebRTC Gateway started: SharedMem:${SHM_PATH} → WebRTC`);
+    const natInfo = process.env.PUBLIC_IP ? ` (NAT: ${process.env.PUBLIC_IP})` : '';
+    console.log(`WebRTC Gateway started: VP8 RTP:${WEBRTC_PORT} → WebRTC${natInfo}`);
 
   } catch (error) {
     console.error('Failed to start UDP stream:', error);

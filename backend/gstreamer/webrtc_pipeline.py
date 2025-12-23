@@ -48,6 +48,9 @@ class WebRTCPipeline:
         self._decoder = None
         self._ghost_pad = None
 
+        # NAT traversal: public IP for rewriting ICE candidates
+        self.public_ip = None
+
     def _log(self, msg):
         print(f"[GStreamer] {msg}", flush=True)
 
@@ -296,7 +299,11 @@ class WebRTCPipeline:
         codec = config.get('codec', 'h264')
         raw_input = config.get('raw', False)  # Raw RTP input from FrameBuffer -r
         vp8_input = config.get('vp8', False)  # VP8 RTP input from FrameBuffer -v
+        self.public_ip = config.get('public_ip')  # For NAT traversal
         self.current_codec = codec
+
+        if self.public_ip:
+            self._log(f"NAT traversal enabled with public IP: {self.public_ip}")
 
         self.pipeline = Gst.Pipeline.new("webrtc-pipeline")
 
@@ -548,6 +555,10 @@ class WebRTCPipeline:
         webrtcbin.set_property("bundle-policy", 3)  # max-bundle
         webrtcbin.set_property("stun-server", "stun://stun.l.google.com:19302")
 
+        # Add local TURN server for symmetric NAT traversal
+        webrtcbin.emit("add-turn-server", "turn://klv:klv123@127.0.0.1:3478")
+        self._log(f"Using STUN + local TURN for NAT traversal")
+
         # Connect signals
         webrtcbin.connect("on-negotiation-needed", self._on_negotiation_needed, client_id)
         webrtcbin.connect("on-ice-candidate", self._on_ice_candidate, client_id)
@@ -695,6 +706,8 @@ class WebRTCPipeline:
 
     def _on_ice_candidate(self, webrtcbin, mline_index, candidate, client_id):
         """Handle new ICE candidate."""
+        self._log(f"ICE candidate: {candidate}")
+        # Note: srflx candidates already have public IP from STUN, no need to rewrite
         self._send_ipc({
             'type': 'ice_candidate',
             'client_id': client_id,

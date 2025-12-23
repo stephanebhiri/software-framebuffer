@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 
-const WS_URL = 'ws://localhost:3001';
+const WS_URL = `ws://${window.location.host}/ws`;
 
 // Deep merge KLV data, keeping last known values for missing fields
 function mergeKLV(prev, next) {
@@ -20,10 +20,12 @@ function mergeKLV(prev, next) {
   return result;
 }
 
-// STUN servers for ICE
+// ICE servers (STUN + local TURN for NAT traversal)
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' }
+  { urls: 'stun:stun1.l.google.com:19302' },
+  // Local coturn TURN server on same host
+  { urls: `turn:${window.location.hostname}:3478`, username: 'klv', credential: 'klv123' }
 ];
 
 export function useWebSocket() {
@@ -174,7 +176,7 @@ export function useWebSocket() {
           mode: message.mode
         });
         if (message.hlsUrl) {
-          setHlsUrl(`http://localhost:3001${message.hlsUrl}`);
+          setHlsUrl(message.hlsUrl);
         } else {
           setHlsUrl(null);
         }
@@ -267,7 +269,7 @@ export function useWebSocket() {
           mode: message.mode
         });
         if (message.hlsUrl) {
-          setHlsUrl(`http://localhost:3001${message.hlsUrl}`);
+          setHlsUrl(message.hlsUrl);
         }
         // Initialize WebRTC if available
         if (message.webrtc) {

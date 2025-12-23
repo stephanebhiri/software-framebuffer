@@ -72,22 +72,25 @@ export class FrameBufferService extends EventEmitter {
     // Merge options
     Object.assign(this.config, options);
 
-    // Build args for standalone framebuffer v1.1.0+ (software-framebuffer)
-    // Usage: framebuffer -i PORT -c CODEC -C CONTAINER [-p SHM_PATH] [-j JITTER] [-o PORT] [-H HOST] [-w W] [-h H] [-f FPS] [-b KBPS]
+    // Build args for SoftwareFrameBuffer v1.1.0
+    // Usage: framebuffer -i PORT -o PORT -H HOST -w W -h H -f FPS -b KBPS -c CODEC -C CONTAINER [-p PATH]
     const args = [
       '-i', String(this.config.inputPort),
+      '-o', String(this.config.outputPort),
+      '-H', this.config.outputHost,
       '-w', String(this.config.width),
       '-h', String(this.config.height),
       '-f', String(this.config.fps),
       '-b', String(this.config.bitrate),
-      '-j', String(this.config.jitterBuffer),
-      '-c', this.config.codec,      // raw, h264, h265, vp8, vp9
-      '-C', this.config.container   // rtp, mpegts, shm, raw, file
+      '-j', String(this.config.jitterBuffer || 1000)
     ];
 
-    // Add container-specific options
+    // Add codec and container
+    args.push('-c', this.config.codec || 'raw');
+    args.push('-C', this.config.container || 'rtp');
+
+    // Add shared memory path if using shm container
     if (this.config.container === 'shm') {
-      // Shared memory output: -p PATH
       args.push('-p', this.config.shmPath);
       // Clean up stale socket before starting
       try {
@@ -99,15 +102,6 @@ export class FrameBufferService extends EventEmitter {
       } catch (e) {
         // Ignore cleanup errors
       }
-    } else if (this.config.container === 'file') {
-      // File output: -F PATH
-      if (this.config.outputFile) {
-        args.push('-F', this.config.outputFile);
-      }
-    } else {
-      // Network output (rtp, mpegts): -o PORT -H HOST
-      args.push('-o', String(this.config.outputPort));
-      args.push('-H', this.config.outputHost);
     }
 
     console.log(`FrameBuffer: Starting ${binaryPath} ${args.join(' ')}`);
