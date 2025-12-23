@@ -72,21 +72,23 @@ export class FrameBufferService extends EventEmitter {
     // Merge options
     Object.assign(this.config, options);
 
-    // Build args matching the C binary's actual supported options:
-    // -i PORT, -o PORT, -H HOST, -w WIDTH, -h HEIGHT, -f FPS, -b KBPS
-    // -r (raw RTP), -v (VP8 RTP), -s [PATH] (shared memory)
+    // Build args for standalone framebuffer v1.1.0+ (software-framebuffer)
+    // Usage: framebuffer -i PORT -c CODEC -C CONTAINER [-p SHM_PATH] [-j JITTER] [-o PORT] [-H HOST] [-w W] [-h H] [-f FPS] [-b KBPS]
     const args = [
       '-i', String(this.config.inputPort),
       '-w', String(this.config.width),
       '-h', String(this.config.height),
       '-f', String(this.config.fps),
-      '-b', String(this.config.bitrate)
+      '-b', String(this.config.bitrate),
+      '-j', String(this.config.jitterBuffer),
+      '-c', this.config.codec,      // raw, h264, h265, vp8, vp9
+      '-C', this.config.container   // rtp, mpegts, shm, raw, file
     ];
 
-    // Add output mode
+    // Add container-specific options
     if (this.config.container === 'shm') {
-      // Shared memory output: -s [PATH]
-      args.push('-s', this.config.shmPath);
+      // Shared memory output: -p PATH
+      args.push('-p', this.config.shmPath);
       // Clean up stale socket before starting
       try {
         const fs = await import('fs');
@@ -97,18 +99,13 @@ export class FrameBufferService extends EventEmitter {
       } catch (e) {
         // Ignore cleanup errors
       }
-    } else if (this.config.codec === 'vp8') {
-      // VP8 RTP output: -v
-      args.push('-v');
-      args.push('-o', String(this.config.outputPort));
-      args.push('-H', this.config.outputHost);
-    } else if (this.config.codec === 'raw') {
-      // Raw RTP output: -r
-      args.push('-r');
-      args.push('-o', String(this.config.outputPort));
-      args.push('-H', this.config.outputHost);
+    } else if (this.config.container === 'file') {
+      // File output: -F PATH
+      if (this.config.outputFile) {
+        args.push('-F', this.config.outputFile);
+      }
     } else {
-      // Default H.264 MPEG-TS output
+      // Network output (rtp, mpegts): -o PORT -H HOST
       args.push('-o', String(this.config.outputPort));
       args.push('-H', this.config.outputHost);
     }

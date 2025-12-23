@@ -42,12 +42,13 @@ typedef struct {
 
     // Configuration
     gchar *shm_path;
-    gint udp_port;      // UDP port for VP8 RTP input
+    gint udp_port;      // UDP port for MPEG-TS input (when not using shm)
     gint width;
     gint height;
     gint fps;
     gint bitrate;
     gchar *stun_server;
+    gboolean shm_input; // Use shared memory input (from FrameBuffer)
 
     // State
     gboolean negotiation_needed;
@@ -486,25 +487,57 @@ static gboolean bus_callback(GstBus *bus, GstMessage *message, gpointer user_dat
 
 /*
  * Create the GStreamer pipeline
- * FULL pipeline: UDP MPEG-TS -> decode -> encode VP8 -> WebRTC
- * NO intermediate UDP hop - everything in one process for zero jitter
+ * Two modes:
+ * 1. UDP mode: MPEG-TS UDP -> decode -> VP8 encode -> WebRTC (single process, no source switching)
+ * 2. SHM mode: Shared Memory (raw I420) -> VP8 encode -> WebRTC (allows seamless source switching)
  */
 static gboolean create_pipeline(void) {
     GError *error = NULL;
+    gchar *pipeline_str;
 
-    // FULL pipeline: udpsrc (MPEG-TS) → decodebin3 → vp8enc → rtpvp8pay → webrtcbin
-    // Uses decodebin3 which handles dynamic pads automatically
-    // NO intermediate UDP hop - everything in one process for zero jitter
-    // Read VP8 RTP from FrameBuffer output (already encoded, smooth timing)
-    // FrameBuffer handles decode + 1s buffer + VP8 encode at stable framerate
-    gchar *pipeline_str = g_strdup_printf(
-        "udpsrc port=%d buffer-size=2097152 "
-        "caps=\"application/x-rtp,media=video,encoding-name=VP8,payload=96,clock-rate=90000\" "
-        "! queue max-size-buffers=30 "
-        "! webrtcbin name=webrtcbin bundle-policy=max-bundle stun-server=%s",
-        gateway->udp_port,
-        gateway->stun_server
-    );
+    if (gateway->shm_input) {
+        // SHM mode: Read raw I420 frames from FrameBuffer via shared memory
+        // This enables seamless source switching - only FrameBuffer restarts on source change
+        // while WebRTC connection stays alive
+        pipeline_str = g_strdup_printf(
+            "shmsrc socket-path=%s is-live=true do-timestamp=true "
+            "! video/x-raw,format=I420,width=%d,height=%d,framerate=%d/1 "
+            "! queue max-size-buffers=10 "
+            "! videoconvert "
+            "! vp8enc deadline=1 cpu-used=8 target-bitrate=%d000 keyframe-max-dist=30 "
+            "! rtpvp8pay pt=96 mtu=1200 picture-id-mode=1 "
+            "! application/x-rtp,media=video,encoding-name=VP8,payload=96,clock-rate=90000 "
+            "! webrtcbin name=webrtcbin bundle-policy=max-bundle stun-server=%s",
+            gateway->shm_path,
+            gateway->width,
+            gateway->height,
+            gateway->fps,
+            gateway->bitrate,
+            gateway->stun_server
+        );
+    } else {
+        // UDP mode: FULL pipeline in single process
+        // MPEG-TS UDP -> 1s buffer -> decode -> VP8 encode -> WebRTC
+        pipeline_str = g_strdup_printf(
+            "udpsrc port=%d buffer-size=67108864 caps=\"video/mpegts,systemstream=true\" "
+            "! queue min-threshold-time=1000000000 max-size-buffers=0 max-size-bytes=0 max-size-time=5000000000 "
+            "! tsparse "
+            "! decodebin3 "
+            "! videoconvert "
+            "! videoscale "
+            "! video/x-raw,width=%d,height=%d "
+            "! queue max-size-buffers=10 "
+            "! vp8enc deadline=1 cpu-used=8 target-bitrate=%d000 keyframe-max-dist=30 "
+            "! rtpvp8pay pt=96 mtu=1200 picture-id-mode=1 "
+            "! application/x-rtp,media=video,encoding-name=VP8,payload=96,clock-rate=90000 "
+            "! webrtcbin name=webrtcbin bundle-policy=max-bundle stun-server=%s",
+            gateway->udp_port,
+            gateway->width,
+            gateway->height,
+            gateway->bitrate,
+            gateway->stun_server
+        );
+    }
 
     g_printerr("Creating pipeline: %s\n", pipeline_str);
 
@@ -550,7 +583,13 @@ static gboolean create_pipeline(void) {
 static void print_usage(const char *prog) {
     g_printerr("Usage: %s [options]\n", prog);
     g_printerr("Options:\n");
-    g_printerr("  -p <port>     UDP port for VP8 RTP input (default: 5002)\n");
+    g_printerr("  -p <port>     UDP port for MPEG-TS input (default: 5000)\n");
+    g_printerr("  -s <path>     Use shared memory input from FrameBuffer\n");
+    g_printerr("                (default path: /tmp/framebuffer.sock)\n");
+    g_printerr("  -w <width>    Video width (default: 640)\n");
+    g_printerr("  -h <height>   Video height (default: 480)\n");
+    g_printerr("  -f <fps>      Framerate (default: 25)\n");
+    g_printerr("  -b <bitrate>  VP8 bitrate in kbps (default: 2000)\n");
     g_printerr("  -t <stun>     STUN server URL (default: stun://stun.l.google.com:19302)\n");
     g_printerr("  --help        Show this help\n");
 }
@@ -567,16 +606,27 @@ int main(int argc, char *argv[]) {
     gateway->fps = 25;
     gateway->bitrate = 2000;
     gateway->stun_server = g_strdup("stun://stun.l.google.com:19302");
+    gateway->shm_path = g_strdup("/tmp/framebuffer.sock");
+    gateway->shm_input = FALSE;
     gateway->negotiation_needed = FALSE;
 
     // Parse arguments
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
             gateway->udp_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-s") == 0) {
+            gateway->shm_input = TRUE;
+            // Optional path argument
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                g_free(gateway->shm_path);
+                gateway->shm_path = g_strdup(argv[++i]);
+            }
         } else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
             gateway->width = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-h") == 0 && i + 1 < argc) {
             gateway->height = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
+            gateway->fps = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
             gateway->bitrate = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
@@ -589,7 +639,12 @@ int main(int argc, char *argv[]) {
     }
 
     g_printerr("WebRTC Gateway starting\n");
-    g_printerr("  UDP port: %d (VP8 RTP input)\n", gateway->udp_port);
+    if (gateway->shm_input) {
+        g_printerr("  Input: Shared Memory %s\n", gateway->shm_path);
+    } else {
+        g_printerr("  Input: UDP port %d (MPEG-TS)\n", gateway->udp_port);
+    }
+    g_printerr("  Resolution: %dx%d @ %dfps\n", gateway->width, gateway->height, gateway->fps);
     g_printerr("  STUN: %s\n", gateway->stun_server);
 
     // Create main loop

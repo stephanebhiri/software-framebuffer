@@ -278,7 +278,7 @@ async function startFileStream(filePath) {
 }
 
 // ===== UDP STREAM MODE with WebRTC (KLVSplitter + FrameBuffer + WebRTC Gateway) =====
-// Architecture: Source -> UDP:5000 -> KLVSplitter -> UDP:5001 -> FrameBuffer -> SharedMem -> WebRTC Gateway -> Chrome
+// Architecture: Source -> UDP:5000 -> KLVSplitter -> UDP:5001 -> FrameBuffer -> SharedMem -> WebRTC -> Chrome
 //                                         ↓
 //                                    Parse KLV -> WebSocket -> Frontend
 let klvSplitter = null;
@@ -357,6 +357,7 @@ async function startUDPStream(port = 5000) {
       bitrate: 2000
     });
     console.log(`WebRTC Gateway started: SharedMem:${SHM_PATH} → WebRTC`);
+
   } catch (error) {
     console.error('Failed to start UDP stream:', error);
     broadcast({ type: 'error', message: error.message });
@@ -505,15 +506,16 @@ function killSimulator() {
   });
 }
 
+const NORMALIZED_DIR = '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/normalized';
 const SAMPLE_FILES = [
-  { id: 'cheyenne', name: 'Cheyenne', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/MISB/Cheyenne.ts', codec: 'h264' },
-  { id: 'falls', name: 'Falls', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/MISB/falls.ts', codec: 'h264' },
-  { id: 'truck', name: 'Truck', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/FMV tutorial data/Truck.ts', codec: 'h264' },
-  { id: 'klv_test', name: 'KLV Test Sync', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/MISB/klv_metadata_test_sync.ts', codec: 'h264' },
-  { id: 'day_flight', name: 'Day Flight', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/Day_Flight.mpg', codec: 'h264' },
-  { id: 'night_flight', name: 'Night Flight IR', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/Night_Flight_IR.mpg', codec: 'h264' },
-  { id: 'esri_4k', name: 'Esri 4K MPEG2', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/MISB/Esri_multiplexer_0.mp4', codec: 'mpeg2' },
-  { id: 'misb_4k', name: 'MISB 4K H264', file: '/Users/stephane/Documents/CV_Stephane_Bhiri/KLV_Display/samples/QGISFMV_Samples/multiplexor/MISB.mp4', codec: 'h264' },
+  { id: 'cheyenne', name: 'Cheyenne', file: `${NORMALIZED_DIR}/Cheyenne.ts`, codec: 'h264' },
+  { id: 'falls', name: 'Falls', file: `${NORMALIZED_DIR}/Falls.ts`, codec: 'h264' },
+  { id: 'truck', name: 'Truck', file: `${NORMALIZED_DIR}/Truck.ts`, codec: 'h264' },
+  { id: 'klv_test', name: 'KLV Test', file: `${NORMALIZED_DIR}/KLV_Test.ts`, codec: 'h264' },
+  { id: 'day_flight', name: 'Day Flight', file: `${NORMALIZED_DIR}/Day_Flight.ts`, codec: 'h264' },
+  { id: 'night_flight', name: 'Night Flight IR', file: `${NORMALIZED_DIR}/Night_Flight_IR.ts`, codec: 'h264' },
+  { id: 'esri_4k', name: 'Esri 4K', file: `${NORMALIZED_DIR}/Esri_4K.ts`, codec: 'h264' },
+  { id: 'misb_4k', name: 'MISB 4K', file: `${NORMALIZED_DIR}/MISB_4K.ts`, codec: 'h264' },
 ];
 
 app.get('/api/simulator/files', (req, res) => {
@@ -538,31 +540,17 @@ app.post('/api/simulator/start', async (req, res) => {
 
   await killSimulator();
 
-  const ffmpegArgs = file.codec === 'mpeg2' ? [
-    '-fflags', '+genpts+igndts+discardcorrupt',
-    '-err_detect', 'ignore_err',
-    '-re',
-    '-stream_loop', '-1',
-    '-i', file.file,
-    '-map', '0:v:0',
-    '-map', '0:d:0?',
-    '-c', 'copy',
-    '-muxdelay', '0',
-    '-muxpreload', '0',
-    '-f', 'mpegts',
-    '-mpegts_copyts', '1',
-    `udp://127.0.0.1:${port}?pkt_size=1316&buffer_size=65535`
-  ] : [
+  // Single ffmpeg with video + data (normalized files have clean timestamps)
+  const ffmpegArgs = [
     '-fflags', '+genpts+igndts',
     '-err_detect', 'ignore_err',
     '-re',
     '-stream_loop', '-1',
     '-i', file.file,
-    '-map', '0:v?',
+    '-map', '0:v',
     '-map', '0:d?',
     '-c', 'copy',
-    '-f', 'mpegts',
-    `udp://127.0.0.1:${port}?pkt_size=1316`
+    '-f', 'mpegts', `udp://127.0.0.1:${port}?pkt_size=1316`
   ];
 
   simulatorProcess = spawn('ffmpeg', ffmpegArgs, { stdio: ['pipe', 'pipe', 'pipe'] });

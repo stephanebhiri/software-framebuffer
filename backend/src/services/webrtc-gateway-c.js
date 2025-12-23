@@ -41,6 +41,14 @@ export class WebRTCGatewayC extends EventEmitter {
 
   /**
    * Start the WebRTC gateway
+   * @param {string} sourceType - 'udp' for UDP input, 'shm' for shared memory input
+   * @param {Object} config - Configuration
+   * @param {number} config.port - UDP port (for udp mode)
+   * @param {string} config.shmPath - Shared memory socket path (for shm mode)
+   * @param {number} config.width - Video width
+   * @param {number} config.height - Video height
+   * @param {number} config.fps - Framerate (for shm mode)
+   * @param {number} config.bitrate - VP8 bitrate in kbps
    */
   async start(sourceType, config) {
     console.log(`WebRTC Gateway C: Starting ${sourceType}`, config);
@@ -50,15 +58,27 @@ export class WebRTCGatewayC extends EventEmitter {
       throw new Error('webrtc-gateway binary not found. Build with: cd backend/src/framebuffer && make');
     }
 
-    const port = config.port || 5000;
     const width = config.width || 640;
     const height = config.height || 480;
     const bitrate = config.bitrate || 2000;
+    const fps = config.fps || 30;
 
-    const args = ['-p', String(port), '-w', String(width), '-h', String(height), '-b', String(bitrate)];
+    const args = ['-w', String(width), '-h', String(height), '-b', String(bitrate)];
+
+    if (sourceType === 'shm') {
+      // Shared memory input mode (from FrameBuffer)
+      const shmPath = config.shmPath || '/tmp/framebuffer.sock';
+      args.push('-s', shmPath);
+      args.push('-f', String(fps));
+    } else {
+      // UDP input mode (direct MPEG-TS)
+      const port = config.port || 5000;
+      args.push('-p', String(port));
+    }
+
     console.log(`WebRTC Gateway C: ${binaryPath} ${args.join(' ')}`);
 
-    // Disable vtdec for MPEG2 decoding
+    // Disable vtdec (macOS hardware decoder) - crashes on MPEG2 4K
     const env = {
       ...process.env,
       GST_PLUGIN_FEATURE_RANK: 'vtdec:0,vtdec_hw:0,vtdechw:0'

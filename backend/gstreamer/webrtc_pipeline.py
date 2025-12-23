@@ -352,35 +352,36 @@ class WebRTCPipeline:
             )
             udpsrc.set_property("caps", rtp_caps)
 
-            # Jitter buffer for smooth playback
-            jitterbuffer = Gst.ElementFactory.make("rtpjitterbuffer", "jitterbuffer")
-            jitterbuffer.set_property("latency", 40)  # 40ms buffer
-            jitterbuffer.set_property("drop-on-latency", True)
-            jitterbuffer.set_property("mode", 0)  # 0=slave, sync to clock
+            # MINIMAL VP8 passthrough - depay + repay only
+            self._log("VP8 RTP minimal passthrough (depay->pay only)")
 
             rtpvp8depay = Gst.ElementFactory.make("rtpvp8depay", "rtpvp8depay")
 
-            # Optimize rtppay for low latency
-            self.rtppay.set_property("mtu", 1200)
-            self.rtppay.set_property("picture-id-mode", 1)  # 15-bit picture ID
+            # Create fresh rtppay for VP8 passthrough
+            rtppay_vp8 = Gst.ElementFactory.make("rtpvp8pay", "rtppay-vp8")
+            rtppay_vp8.set_property("pt", 96)
+            rtppay_vp8.set_property("mtu", 1200)
+            self.rtppay = rtppay_vp8  # Update reference
 
-            # Minimal queue - just for thread decoupling
-            queue1.set_property("max-size-buffers", 3)
-            queue1.set_property("max-size-time", 0)
-            queue1.set_property("max-size-bytes", 0)
+            # Fresh queue for RTP
+            vp8_queue = Gst.ElementFactory.make("queue", "vp8-queue")
+            vp8_queue.set_property("max-size-buffers", 0)
+            vp8_queue.set_property("max-size-time", 0)
+            vp8_queue.set_property("max-size-bytes", 0)
 
             # Add elements
-            for elem in [udpsrc, jitterbuffer, queue1, rtpvp8depay,
-                         self.rtppay, self.tee,
-                         vlc_queue, vlc_udpsink]:
+            for elem in [udpsrc, vp8_queue, rtpvp8depay, rtppay_vp8, self.tee]:
                 self.pipeline.add(elem)
 
-            # Link: udpsrc -> jitterbuffer -> queue -> rtpvp8depay -> rtpvp8pay -> tee
-            udpsrc.link(jitterbuffer)
-            jitterbuffer.link(queue1)
-            queue1.link(rtpvp8depay)
-            rtpvp8depay.link(self.rtppay)
-            self.rtppay.link(self.tee)
+            # Link: udpsrc -> queue -> depay -> pay -> tee
+            if not udpsrc.link(vp8_queue):
+                self._log("ERROR: udpsrc -> vp8_queue link failed")
+            if not vp8_queue.link(rtpvp8depay):
+                self._log("ERROR: vp8_queue -> rtpvp8depay link failed")
+            if not rtpvp8depay.link(rtppay_vp8):
+                self._log("ERROR: rtpvp8depay -> rtppay_vp8 link failed")
+            if not rtppay_vp8.link(self.tee):
+                self._log("ERROR: rtppay_vp8 -> tee link failed")
 
         elif raw_input:
             # ===== RAW RTP MODE =====
@@ -472,12 +473,13 @@ class WebRTCPipeline:
 
             tsdemux.connect("pad-added", on_demux_pad_added)
 
-        # Link VLC debug output from tee
-        tee_vlc_pad = self.tee.request_pad_simple("src_%u")
-        vlc_queue_sink = vlc_queue.get_static_pad("sink")
-        tee_vlc_pad.link(vlc_queue_sink)
-        vlc_queue.link(vlc_udpsink)
-        self._log("VLC debug output enabled on rtp://127.0.0.1:5004")
+        # Link VLC debug output from tee (skip for VP8 passthrough mode)
+        if not vp8_input:
+            tee_vlc_pad = self.tee.request_pad_simple("src_%u")
+            vlc_queue_sink = vlc_queue.get_static_pad("sink")
+            tee_vlc_pad.link(vlc_queue_sink)
+            vlc_queue.link(vlc_udpsink)
+            self._log("VLC debug output enabled on rtp://127.0.0.1:5004")
 
         # Add probe to monitor data flow
         self._buffer_count = 0

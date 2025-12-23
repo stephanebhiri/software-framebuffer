@@ -7,7 +7,7 @@ import { useWebSocket } from './hooks/useWebSocket';
 import './App.css';
 
 function App() {
-  const { isConnected, klvData, status, hlsUrl, webrtcStream, startStream, startUDP, stopStream } = useWebSocket();
+  const { isConnected, klvData, sensors, status, hlsUrl, webrtcStream, startStream, startUDP, stopStream } = useWebSocket();
   const [filePath, setFilePath] = useState('');
   const [udpPort, setUdpPort] = useState('5000');
 
@@ -44,8 +44,8 @@ function App() {
             <>
               <span className="source-info">
                 {status.mode === 'udp'
-                  ? `WebRTC :${status.source?.split(':').pop()}`
-                  : 'File (HLS)'}
+                  ? `UDP IN :${status.source?.split(':').pop()} → WebRTC`
+                  : 'File → HLS'}
               </span>
               {webrtcStream && <span className="rtc-badge">RTC</span>}
               <button onClick={stopStream} className="stop">
@@ -59,15 +59,16 @@ function App() {
       <main className="app-main">
         <div className="left-panel">
           <VideoPlayer src={hlsUrl} webrtcStream={webrtcStream} />
-          <Map klvData={klvData} />
+          <Map klvData={klvData} sensors={sensors} />
         </div>
         <div className="right-panel">
           <InfoPanel
             klvData={klvData}
+            sensors={sensors}
             status={status}
             isConnected={isConnected}
           />
-          <SimulatorPanel />
+          <SimulatorPanel port={parseInt(udpPort) || 5000} />
         </div>
       </main>
     </div>

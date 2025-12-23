@@ -23,17 +23,24 @@ const sensorIcon = new L.Icon({
   iconAnchor: [16, 16],
 });
 
-const targetIcon = new L.Icon({
-  iconUrl: 'data:image/svg+xml;base64,' + btoa(`
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="32" height="32">
-      <circle cx="12" cy="12" r="10" fill="#ef4444" stroke="white" stroke-width="2"/>
-      <line x1="12" y1="2" x2="12" y2="22" stroke="white" stroke-width="2"/>
-      <line x1="2" y1="12" x2="22" y2="12" stroke="white" stroke-width="2"/>
-    </svg>
-  `),
-  iconSize: [32, 32],
-  iconAnchor: [16, 16],
-});
+// Target icons with different colors for multi-sensor support
+const SENSOR_COLORS = ['#ef4444', '#8b5cf6', '#22c55e', '#f59e0b'];
+
+function createTargetIcon(color = '#ef4444') {
+  return new L.Icon({
+    iconUrl: 'data:image/svg+xml;base64,' + btoa(`
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="32" height="32">
+        <circle cx="12" cy="12" r="10" fill="${color}" stroke="white" stroke-width="2"/>
+        <line x1="12" y1="2" x2="12" y2="22" stroke="white" stroke-width="2"/>
+        <line x1="2" y1="12" x2="22" y2="12" stroke="white" stroke-width="2"/>
+      </svg>
+    `),
+    iconSize: [32, 32],
+    iconAnchor: [16, 16],
+  });
+}
+
+const targetIcon = createTargetIcon('#ef4444');
 
 /**
  * Calculate a point at a given distance and bearing from a start point
@@ -108,7 +115,7 @@ function calculateFOVCone(sensorLat, sensorLon, platformHeading, sensorAzimuth, 
   return points;
 }
 
-function MapUpdater({ sensorPos, targetPos, fovCone }) {
+function MapUpdater({ sensorPos, targetPositions, fovCone }) {
   const map = useMap();
   const userInteractedRef = useRef(false);
   const interactionTimeoutRef = useRef(null);
@@ -153,8 +160,9 @@ function MapUpdater({ sensorPos, targetPos, fovCone }) {
     // Collect all points to fit
     const points = [sensorPos];
 
-    if (targetPos) {
-      points.push(targetPos);
+    // Add all target positions
+    if (targetPositions && targetPositions.length > 0) {
+      points.push(...targetPositions);
     }
 
     if (fovCone && fovCone.length > 0) {
@@ -166,14 +174,15 @@ function MapUpdater({ sensorPos, targetPos, fovCone }) {
       map.fitBounds(bounds, { padding: [30, 30], maxZoom: 16, animate: true, duration: 0.3 });
       lastFitRef.current = now;
     }
-  }, [sensorPos, targetPos, fovCone, map]);
+  }, [sensorPos, targetPositions, fovCone, map]);
 
   return null;
 }
 
-export function Map({ klvData }) {
+export function Map({ klvData, sensors }) {
   const [history, setHistory] = useState([]);
   const [center, setCenter] = useState([48.8566, 2.3522]); // Paris default
+  const sensorIds = Object.keys(sensors || {});
 
   useEffect(() => {
     if (!klvData?.sensor?.latitude || !klvData?.sensor?.longitude) return;
@@ -191,9 +200,14 @@ export function Map({ klvData }) {
     ? [klvData.sensor.latitude, klvData.sensor.longitude]
     : null;
 
-  const targetPos = klvData?.target?.latitude && klvData?.target?.longitude
-    ? [klvData.target.latitude, klvData.target.longitude]
-    : null;
+  // Collect all target positions from all sensors
+  const targetPositions = sensorIds.map(sensorId => {
+    const sensorData = sensors[sensorId];
+    if (sensorData?.target?.latitude && sensorData?.target?.longitude) {
+      return [sensorData.target.latitude, sensorData.target.longitude];
+    }
+    return null;
+  }).filter(Boolean);
 
   // Calculate FOV cone
   // Absolute azimuth = platformHeading + sensorRelativeAzimuth
@@ -217,7 +231,7 @@ export function Map({ klvData }) {
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
         />
-        <MapUpdater sensorPos={sensorPos} targetPos={targetPos} fovCone={fovCone} />
+        <MapUpdater sensorPos={sensorPos} targetPositions={targetPositions} fovCone={fovCone} />
 
         {/* FOV Cone */}
         {fovCone && (
@@ -242,26 +256,45 @@ export function Map({ klvData }) {
           />
         )}
 
-        {/* Line from sensor to target */}
-        {sensorPos && targetPos && (
-          <Polyline
-            positions={[sensorPos, targetPos]}
-            color="#ef4444"
-            weight={2}
-            opacity={0.5}
-            dashArray="5, 10"
-          />
-        )}
+        {/* Lines from sensor to all targets */}
+        {sensorPos && sensorIds.map((sensorId, idx) => {
+          const sensorData = sensors[sensorId];
+          const pos = sensorData?.target?.latitude && sensorData?.target?.longitude
+            ? [sensorData.target.latitude, sensorData.target.longitude]
+            : null;
+          if (!pos) return null;
+          return (
+            <Polyline
+              key={`line-${sensorId}`}
+              positions={[sensorPos, pos]}
+              color={SENSOR_COLORS[idx % SENSOR_COLORS.length]}
+              weight={2}
+              opacity={0.5}
+              dashArray="5, 10"
+            />
+          );
+        })}
 
         {/* Sensor position (drone) */}
         {sensorPos && (
           <Marker position={sensorPos} icon={sensorIcon} />
         )}
 
-        {/* Target position (frame center) */}
-        {targetPos && (
-          <Marker position={targetPos} icon={targetIcon} />
-        )}
+        {/* Target positions for all sensors */}
+        {sensorIds.map((sensorId, idx) => {
+          const sensorData = sensors[sensorId];
+          const pos = sensorData?.target?.latitude && sensorData?.target?.longitude
+            ? [sensorData.target.latitude, sensorData.target.longitude]
+            : null;
+          if (!pos) return null;
+          return (
+            <Marker
+              key={`target-${sensorId}`}
+              position={pos}
+              icon={createTargetIcon(SENSOR_COLORS[idx % SENSOR_COLORS.length])}
+            />
+          );
+        })}
       </MapContainer>
     </div>
   );

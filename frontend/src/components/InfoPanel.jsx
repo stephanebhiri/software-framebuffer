@@ -1,4 +1,8 @@
-export function InfoPanel({ klvData, status, isConnected }) {
+const SENSOR_COLORS = ['#ef4444', '#8b5cf6', '#22c55e', '#f59e0b'];
+
+export function InfoPanel({ klvData, sensors, status, isConnected }) {
+  const sensorIds = Object.keys(sensors || {});
+
   const formatCoord = (val, isLat) => {
     if (val == null) return '--';
     const dir = isLat ? (val >= 0 ? 'N' : 'S') : (val >= 0 ? 'E' : 'W');
@@ -6,144 +10,140 @@ export function InfoPanel({ klvData, status, isConnected }) {
   };
 
   const formatDeg = (val) => val != null ? `${val.toFixed(1)}°` : '--';
-  const formatAltBoth = (m, ft) => {
+  const formatAlt = (m, ft) => {
     if (m == null) return '--';
-    return `${m.toFixed(0)}m / ${ft}ft`;
+    return `${m.toFixed(0)}m`;
   };
   const formatSpeed = (val, unit = 'm/s') => val != null ? `${val} ${unit}` : '--';
 
+  // Render a single sensor column
+  const SensorColumn = ({ sensorId, sensorData, color }) => (
+    <div className="sensor-column" style={{ borderTopColor: color }}>
+      <div className="sensor-column-header" style={{ background: color }}>
+        {sensorData?._sensorName || sensorId}
+      </div>
+
+      <div className="sensor-data">
+        <div className="data-group">
+          <div className="data-label">Position</div>
+          <div className="data-row">
+            <span>Lat</span>
+            <span>{formatCoord(sensorData?.sensor?.latitude, true)}</span>
+          </div>
+          <div className="data-row">
+            <span>Lon</span>
+            <span>{formatCoord(sensorData?.sensor?.longitude, false)}</span>
+          </div>
+          <div className="data-row">
+            <span>Alt</span>
+            <span>{formatAlt(sensorData?.sensor?.altitudeM)}</span>
+          </div>
+        </div>
+
+        <div className="data-group">
+          <div className="data-label">Orientation</div>
+          <div className="data-row">
+            <span>Az</span>
+            <span>{formatDeg(sensorData?.sensor?.azimuth)}</span>
+          </div>
+          <div className="data-row">
+            <span>El</span>
+            <span>{formatDeg(sensorData?.sensor?.elevation)}</span>
+          </div>
+          <div className="data-row">
+            <span>HFOV</span>
+            <span>{formatDeg(sensorData?.sensor?.hfov)}</span>
+          </div>
+        </div>
+
+        <div className="data-group">
+          <div className="data-label">Frame Center</div>
+          <div className="data-row">
+            <span>Lat</span>
+            <span>{formatCoord(sensorData?.target?.latitude, true)}</span>
+          </div>
+          <div className="data-row">
+            <span>Lon</span>
+            <span>{formatCoord(sensorData?.target?.longitude, false)}</span>
+          </div>
+          <div className="data-row highlight">
+            <span>Elev</span>
+            <span>{formatAlt(sensorData?.target?.elevationM)}</span>
+          </div>
+          <div className="data-row highlight">
+            <span>Slant</span>
+            <span>{formatAlt(sensorData?.target?.slantRangeM)}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
   return (
     <div className="info-panel">
+      {/* Header */}
       <div className="info-header">
         <span className={`status-dot ${isConnected ? 'connected' : 'disconnected'}`} />
         <span>{isConnected ? 'Connected' : 'Disconnected'}</span>
         {status.streaming && <span className="live-badge">LIVE</span>}
+        {sensorIds.length > 1 && (
+          <span className="multi-sensor-badge">{sensorIds.length} sensors</span>
+        )}
       </div>
 
-      {/* Mission Info */}
-      {klvData?.mission && (
-        <div className="info-section">
-          <h3>Mission</h3>
-          {klvData.mission.id && (
+      {/* Common Info: Mission & Platform */}
+      <div className="common-info">
+        {klvData?.mission && (
+          <div className="info-section compact">
+            <h3>Mission</h3>
             <div className="info-row">
-              <span>Mission</span>
-              <span className="value-small">{klvData.mission.id}</span>
+              <span>Platform</span>
+              <span>{klvData.mission.platformDesignation || klvData.mission.tailNumber || '--'}</span>
             </div>
-          )}
-          {klvData.mission.tailNumber && (
-            <div className="info-row">
-              <span>Tail #</span>
-              <span>{klvData.mission.tailNumber}</span>
+            {klvData.mission.id && (
+              <div className="info-row">
+                <span>ID</span>
+                <span className="value-small">{klvData.mission.id}</span>
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="info-section compact">
+          <h3>Platform</h3>
+          <div className="platform-row">
+            <div>
+              <span className="label">HDG</span>
+              <span className="value">{formatDeg(klvData?.platform?.heading)}</span>
             </div>
-          )}
-          {klvData.mission.platformDesignation && (
-            <div className="info-row">
-              <span>Aircraft</span>
-              <span>{klvData.mission.platformDesignation}</span>
+            <div>
+              <span className="label">GS</span>
+              <span className="value">{klvData?.platform?.groundSpeed ?? '--'} kts</span>
             </div>
-          )}
-          {klvData.mission.sensorName && (
-            <div className="info-row">
-              <span>Sensor</span>
-              <span>{klvData.mission.sensorName}</span>
-            </div>
-          )}
+          </div>
         </div>
+      </div>
+
+      {/* Sensor Columns */}
+      {sensorIds.length > 0 ? (
+        <div className={`sensors-grid sensors-${Math.min(sensorIds.length, 2)}`}>
+          {sensorIds.map((sensorId, idx) => (
+            <SensorColumn
+              key={sensorId}
+              sensorId={sensorId}
+              sensorData={sensors[sensorId]}
+              color={SENSOR_COLORS[idx % SENSOR_COLORS.length]}
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="no-sensors">Waiting for KLV data...</div>
       )}
-
-      {/* Sensor Position */}
-      <div className="info-section">
-        <h3>Sensor Position</h3>
-        <div className="info-row">
-          <span>Lat</span>
-          <span>{formatCoord(klvData?.sensor?.latitude, true)}</span>
-        </div>
-        <div className="info-row">
-          <span>Lon</span>
-          <span>{formatCoord(klvData?.sensor?.longitude, false)}</span>
-        </div>
-        <div className="info-row">
-          <span>Alt</span>
-          <span>{formatAltBoth(klvData?.sensor?.altitudeM, klvData?.sensor?.altitudeFt)}</span>
-        </div>
-      </div>
-
-      {/* Sensor Orientation */}
-      <div className="info-section">
-        <h3>Sensor Orientation</h3>
-        <div className="info-row">
-          <span>HFOV</span>
-          <span>{formatDeg(klvData?.sensor?.hfov)}</span>
-        </div>
-        <div className="info-row">
-          <span>VFOV</span>
-          <span>{formatDeg(klvData?.sensor?.vfov)}</span>
-        </div>
-        <div className="info-row">
-          <span>Azimuth</span>
-          <span>{formatDeg(klvData?.sensor?.azimuth)}</span>
-        </div>
-        <div className="info-row">
-          <span>Elevation</span>
-          <span>{formatDeg(klvData?.sensor?.elevation)}</span>
-        </div>
-      </div>
-
-      {/* Platform State */}
-      <div className="info-section">
-        <h3>Platform</h3>
-        <div className="info-row">
-          <span>Heading</span>
-          <span>{formatDeg(klvData?.platform?.heading)}</span>
-        </div>
-        <div className="info-row">
-          <span>Pitch</span>
-          <span>{formatDeg(klvData?.platform?.pitch)}</span>
-        </div>
-        <div className="info-row">
-          <span>Roll</span>
-          <span>{formatDeg(klvData?.platform?.roll)}</span>
-        </div>
-        {klvData?.platform?.groundSpeed != null && (
-          <div className="info-row">
-            <span>GS</span>
-            <span>{formatSpeed(klvData.platform.groundSpeed, 'kts')}</span>
-          </div>
-        )}
-        {klvData?.platform?.trueAirspeed != null && (
-          <div className="info-row">
-            <span>TAS</span>
-            <span>{formatSpeed(klvData.platform.trueAirspeed, 'kts')}</span>
-          </div>
-        )}
-      </div>
-
-      {/* Target / Frame Center */}
-      <div className="info-section">
-        <h3>Frame Center</h3>
-        <div className="info-row">
-          <span>Lat</span>
-          <span>{formatCoord(klvData?.target?.latitude, true)}</span>
-        </div>
-        <div className="info-row">
-          <span>Lon</span>
-          <span>{formatCoord(klvData?.target?.longitude, false)}</span>
-        </div>
-        <div className="info-row">
-          <span>Elev</span>
-          <span>{formatAltBoth(klvData?.target?.elevationM, klvData?.target?.elevationFt)}</span>
-        </div>
-        <div className="info-row">
-          <span>Slant</span>
-          <span>{formatAltBoth(klvData?.target?.slantRangeM, klvData?.target?.slantRangeFt)}</span>
-        </div>
-      </div>
 
       {/* Timestamp */}
       {klvData?.timestamp && (
         <div className="info-timestamp">
-          <div>{new Date(klvData.timestamp).toLocaleString()}</div>
-          <div className="timestamp-iso">{klvData.timestamp}</div>
+          {new Date(klvData.timestamp).toLocaleTimeString()}
         </div>
       )}
     </div>

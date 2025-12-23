@@ -2,6 +2,24 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 
 const WS_URL = 'ws://localhost:3001';
 
+// Deep merge KLV data, keeping last known values for missing fields
+function mergeKLV(prev, next) {
+  if (!prev) return next;
+  if (!next) return prev;
+
+  const result = { ...prev };
+  for (const key of Object.keys(next)) {
+    if (next[key] !== null && next[key] !== undefined) {
+      if (typeof next[key] === 'object' && !Array.isArray(next[key])) {
+        result[key] = mergeKLV(prev[key], next[key]);
+      } else {
+        result[key] = next[key];
+      }
+    }
+  }
+  return result;
+}
+
 // STUN servers for ICE
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
@@ -10,7 +28,8 @@ const ICE_SERVERS = [
 
 export function useWebSocket() {
   const [isConnected, setIsConnected] = useState(false);
-  const [klvData, setKlvData] = useState(null);
+  const [klvData, setKlvData] = useState(null);           // Combined/primary sensor data
+  const [sensors, setSensors] = useState({});              // All sensors by ID
   const [status, setStatus] = useState({ streaming: false, source: null, mode: null });
   const [hlsUrl, setHlsUrl] = useState(null);
   const [webrtcStream, setWebrtcStream] = useState(null);
@@ -20,6 +39,11 @@ export function useWebSocket() {
   const reconnectTimeoutRef = useRef(null);
   const pcRef = useRef(null);  // RTCPeerConnection
   const webrtcInitialized = useRef(false);
+  const sensorTimestamps = useRef({});    // Last KLV timestamp PER SENSOR
+  const sensorMissions = useRef({});      // Last Mission ID PER SENSOR
+  const lastMissionId = useRef(null);     // Last mission ID for stream change detection
+  const lastResetTime = useRef(0);        // Grace period after reset
+  const sensorLastSeen = useRef({});      // Track last seen time per sensor
 
   const send = useCallback((data) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -161,7 +185,79 @@ export function useWebSocket() {
         break;
 
       case 'klv':
-        setKlvData(message.data);
+        {
+          const sensorId = message.sensorId || 'default';
+          const sensorName = message.sensorName || sensorId;
+          const data = { ...message.data, _sensorName: sensorName };
+          const currentTs = data.unixTimestamp;
+          const currentMission = data.mission?.id;
+          // Per-sensor timestamp and mission tracking (sensors can have very different values!)
+          const lastTs = sensorTimestamps.current[sensorId] || null;
+          const lastMission = sensorMissions.current[sensorId] || null;
+          const now = Date.now();
+
+          // Grace period: don't detect new stream for 2s after a reset
+          const inGracePeriod = (now - lastResetTime.current) < 2000;
+
+          // Detect stream change via:
+          // 1. Mission ID changed
+          // 2. Timestamp goes backward or jumps > 5 seconds
+          let isNewStream = false;
+
+          if (!inGracePeriod) {
+            if (lastMission !== null && currentMission && currentMission !== lastMission) {
+              console.log(`Auto-lock: Mission ID changed (${lastMission} -> ${currentMission})`);
+              isNewStream = true;
+            } else if (lastTs !== null && currentTs !== null) {
+              const delta = currentTs - lastTs;
+              if (delta < -1 || delta > 5) {
+                console.log(`Auto-lock: Timestamp discontinuity (delta=${delta}s)`);
+                isNewStream = true;
+              }
+            }
+          }
+
+          // Update last seen time for this sensor
+          sensorLastSeen.current[sensorId] = now;
+
+          if (isNewStream) {
+            console.log(`Auto-lock: Resetting sensors, starting with "${sensorId}"`);
+            setSensors({ [sensorId]: data });
+            setKlvData(data);
+            lastResetTime.current = now;
+            sensorLastSeen.current = { [sensorId]: now };
+            // Reset per-sensor timestamps for new stream
+            sensorTimestamps.current = { [sensorId]: currentTs };
+          } else {
+            // Remove stale sensors (not seen for 3 seconds)
+            const SENSOR_TIMEOUT = 3000;
+            const staleSensors = Object.keys(sensorLastSeen.current)
+              .filter(id => now - sensorLastSeen.current[id] > SENSOR_TIMEOUT);
+
+            if (staleSensors.length > 0) {
+              console.log(`Auto-lock: Removing stale sensors: ${staleSensors.join(', ')}`);
+              staleSensors.forEach(id => delete sensorLastSeen.current[id]);
+            }
+
+            setSensors(prev => {
+              // Remove stale sensors from state
+              const updated = { ...prev };
+              staleSensors.forEach(id => delete updated[id]);
+              // Log new sensor detection
+              if (!prev[sensorId]) {
+                console.log(`[KLV] New sensor detected: "${sensorId}"`);
+              }
+              // Add/update current sensor
+              updated[sensorId] = mergeKLV(prev[sensorId], data);
+              return updated;
+            });
+            setKlvData(prev => mergeKLV(prev, data));
+          }
+
+          // Update per-sensor timestamp and mission tracking
+          if (currentTs !== null) sensorTimestamps.current[sensorId] = currentTs;
+          if (currentMission) sensorMissions.current[sensorId] = currentMission;
+        }
         break;
 
       case 'stream-started':
@@ -177,10 +273,18 @@ export function useWebSocket() {
         if (message.webrtc) {
           initWebRTC();
         }
+        // Reset tracking for new stream
+        sensorTimestamps.current = {};
+        lastMissionId.current = null;
+        break;
+
+      case 'source-switching':
+        // Just log - auto-lock will handle sensor reset via KLV gap detection
+        console.log('Source switching...');
         break;
 
       case 'stream-switched':
-        // Hot-swap: pipeline restarts, need new WebRTC negotiation
+        // Hot-swap: just update status - auto-lock handles sensors
         console.log('Stream switched to:', message.source);
         setStatus({
           streaming: true,
@@ -210,6 +314,7 @@ export function useWebSocket() {
         setStatus({ streaming: false, source: null, mode: null });
         setHlsUrl(null);
         setKlvData(null);
+        setSensors({});
         cleanupWebRTC();
         break;
 
@@ -284,6 +389,7 @@ export function useWebSocket() {
   return {
     isConnected,
     klvData,
+    sensors,        // All sensors by ID (for multi-sensor display)
     status,
     hlsUrl,
     webrtcStream,

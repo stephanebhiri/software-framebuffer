@@ -42,6 +42,7 @@ export function VideoPlayer({ src, webrtcStream }) {
           autoPlay
           muted
           playsInline
+          onClick={(e) => e.preventDefault()}
           style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#000' }}
         />
       ) : (
